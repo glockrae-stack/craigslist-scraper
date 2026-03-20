@@ -8,11 +8,11 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 # ============================================================
 # CREDENTIALS
 # ============================================================
-TOKEN = "8761442506:AAFPCQyaKuSbjuc4s8SwzKYvMAFHQ5QlgXY"
+TOKEN   = "8761442506:AAFPCQyaKuSbjuc4s8SwzKYvMAFHQ5QlgXY"
 CHAT_ID = "6549307194"
 
 # ============================================================
-# THE 17 HIGH-VELOCITY MARKETS
+# 17 MARKETS
 # ============================================================
 CITIES = [
     "phoenix", "losangeles", "sandiego", "sfbay", "cosprings",
@@ -41,24 +41,24 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO
 )
-seen_ids      = set()
-scan_active   = True
-leads_found   = 0
-scan_count    = 0
-start_time    = datetime.now()
+seen_ids    = set()
+scan_active = True
+leads_found = 0
+scan_count  = 0
+start_time  = datetime.now()
 
 # ============================================================
-# MAIN MENU KEYBOARD
+# KEYBOARD
 # ============================================================
 def main_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📡 Ping Bot",        callback_data="ping"),
-         InlineKeyboardButton("📊 Stats",           callback_data="stats")],
-        [InlineKeyboardButton("⏸ Pause Scanner",   callback_data="pause"),
-         InlineKeyboardButton("▶️ Resume Scanner",  callback_data="resume")],
-        [InlineKeyboardButton("🧹 Clear Memory",    callback_data="clear"),
-         InlineKeyboardButton("🏙 Cities List",     callback_data="cities")],
-        [InlineKeyboardButton("💡 Strategy Info",   callback_data="strategy")],
+        [InlineKeyboardButton("📡 Ping",         callback_data="ping"),
+         InlineKeyboardButton("📊 Stats",        callback_data="stats")],
+        [InlineKeyboardButton("⏸ Pause",         callback_data="pause"),
+         InlineKeyboardButton("▶️ Resume",        callback_data="resume")],
+        [InlineKeyboardButton("🧹 Clear Memory", callback_data="clear"),
+         InlineKeyboardButton("🏙 Cities",       callback_data="cities")],
+        [InlineKeyboardButton("💡 Strategy",     callback_data="strategy")],
     ])
 
 # ============================================================
@@ -69,21 +69,21 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🚀 *MONEY MAGNET ONLINE*\n\n"
         "Scanning *17 cities* every 10 minutes.\n"
         "Hunting distressed assets + free furniture flips.\n\n"
-        "Pick an option:",
+        "Pick an option 👇",
         parse_mode="Markdown",
         reply_markup=main_menu()
     )
 
-async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uptime = str(datetime.now() - start_time).split(".")[0]
     state  = "▶️ ACTIVE" if scan_active else "⏸ PAUSED"
     await update.message.reply_text(
-        f"🤖 *BOT STATUS*\n\n"
+        f"🤖 *STATUS*\n\n"
         f"Scanner: {state}\n"
         f"Uptime: `{uptime}`\n"
         f"Scans run: `{scan_count}`\n"
         f"Leads found: `{leads_found}`\n"
-        f"Memory (seen IDs): `{len(seen_ids)}`",
+        f"Seen IDs in memory: `{len(seen_ids)}`",
         parse_mode="Markdown",
         reply_markup=main_menu()
     )
@@ -92,13 +92,13 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # BUTTON HANDLER
 # ============================================================
 async def button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global scan_active, leads_found, seen_ids
+    global scan_active, seen_ids
     q = update.callback_query
     await q.answer()
 
     if q.data == "ping":
         await q.edit_message_text(
-            "✅ *PONG!* Bot is alive and running.",
+            "✅ *PONG!* Bot is alive.",
             parse_mode="Markdown",
             reply_markup=main_menu()
         )
@@ -121,7 +121,7 @@ async def button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif q.data == "pause":
         scan_active = False
         await q.edit_message_text(
-            "⏸ *Scanner paused.*\nNo alerts will be sent until you resume.",
+            "⏸ *Scanner paused.*",
             parse_mode="Markdown",
             reply_markup=main_menu()
         )
@@ -129,7 +129,7 @@ async def button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif q.data == "resume":
         scan_active = True
         await q.edit_message_text(
-            "▶️ *Scanner resumed.*\nBack on the hunt.",
+            "▶️ *Scanner resumed.* Back on the hunt.",
             parse_mode="Markdown",
             reply_markup=main_menu()
         )
@@ -137,7 +137,7 @@ async def button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif q.data == "clear":
         seen_ids.clear()
         await q.edit_message_text(
-            "🧹 *Memory cleared.*\nAll listings will re-scan fresh next cycle.",
+            "🧹 *Memory cleared.* Fresh scan next cycle.",
             parse_mode="Markdown",
             reply_markup=main_menu()
         )
@@ -156,7 +156,7 @@ async def button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "1️⃣ Scan distressed sellers (divorce, moving, must sell)\n"
             "2️⃣ Target high-ticket assets (boats, cars, jet skis)\n"
             "3️⃣ Lock in with DocuSign Purchase Agreement\n"
-            "4️⃣ Flip contract or wholesale — never touch the asset\n\n"
+            "4️⃣ Flip the contract — never touch the asset\n\n"
             "🆓 *FREE SCALP:* Grab furniture, resell same day.\n\n"
             "_Motivation > Price. Always._",
             parse_mode="Markdown",
@@ -166,15 +166,16 @@ async def button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 # SCAN ENGINE
 # ============================================================
-async def scan_loop(app):
+async def scan_loop(app: Application):
     global scan_active, leads_found, scan_count, seen_ids
+
+    await asyncio.sleep(5)
 
     while True:
         if scan_active:
             logging.info(f"--- SCAN #{scan_count + 1} STARTING ---")
             for city in CITIES:
                 try:
-                    # HIGH-TICKET: distressed assets
                     s = feedparser.parse(f"https://{city}.craigslist.org/search/sss?format=rss")
                     for e in s.entries:
                         if e.id in seen_ids:
@@ -186,13 +187,12 @@ async def scan_loop(app):
                                 f"📍 {city.upper()}\n"
                                 f"📝 {e.title}\n"
                                 f"🔗 {e.link}\n\n"
-                                f"⚡ _Seller is distressed. Send DocuSign PA now._"
+                                f"⚡ _Distressed seller. Send DocuSign PA now._"
                             )
                             await app.bot.send_message(CHAT_ID, msg, parse_mode="Markdown")
                             leads_found += 1
                         seen_ids.add(e.id)
 
-                    # FREE SCALP: furniture
                     f = feedparser.parse(f"https://{city}.craigslist.org/search/zip?format=rss")
                     for e in f.entries:
                         if e.id in seen_ids:
@@ -209,38 +209,39 @@ async def scan_loop(app):
                         seen_ids.add(e.id)
 
                 except Exception as ex:
-                    logging.warning(f"Error in {city}: {ex}")
+                    logging.warning(f"Error scanning {city}: {ex}")
                     continue
 
             scan_count += 1
 
-            # Memory guard for Railway Hobby tier
             if len(seen_ids) > 3000:
                 seen_ids.clear()
                 logging.info("Memory cleared — hit 3000 ID limit.")
 
-            logging.info(f"Scan #{scan_count} done. Sleeping 10m. Total leads: {leads_found}")
+            logging.info(f"Scan #{scan_count} done. Leads: {leads_found}. Sleeping 10m.")
 
         await asyncio.sleep(600)
 
 # ============================================================
 # ENTRY POINT
 # ============================================================
-async def main():
-    app = Application.builder().token(TOKEN).build()
+async def post_init(app: Application):
+    asyncio.create_task(scan_loop(app))
+    logging.info("=== MONEY MAGNET ONLINE ===")
+
+def main():
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start",  start))
-    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CallbackQueryHandler(button))
 
-    await app.initialize()
-    await app.start()
-
-    asyncio.create_task(scan_loop(app))
-
-    logging.info("=== MONEY MAGNET ONLINE ===")
-    await app.updater.start_polling(drop_pending_updates=True)
-    await asyncio.Event().wait()
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
