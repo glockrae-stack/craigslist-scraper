@@ -1,7 +1,12 @@
 """
-Virtual Broker Bot v4 — DEBUG BUILD
-Adds raw response logging so you can see exactly what's coming back.
-Watch your Railway terminal — it'll tell you exactly what's failing.
+Virtual Broker Bot v5
+─────────────────────────────────────────────
+- Craigslist: 17 cities via RSS (cto + boo + zip) — every 90s
+- OfferUp:    27 cities via mobile API — every 5 mins, 8s between cities
+- seen_ids.txt is append-only (survives Railway restarts)
+
+Install:
+    pip install python-telegram-bot feedparser httpx
 """
 
 import asyncio
@@ -10,6 +15,7 @@ import httpx
 import os
 import re
 import logging
+import random
 from functools import partial
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -20,9 +26,13 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 TOKEN    = "8761442506:AAFPCQyaKuSbjuc4s8SwzKYvMAFHQ5QlgXY"
 CHAT_ID  = "6549307194"
 DB_FILE  = "seen_ids.txt"
-CL_SLEEP = 90
-OU_SLEEP = 120
+CL_SLEEP = 90    # Craigslist: 90s between full cycles
+OU_SLEEP = 300   # OfferUp: 5 mins between full cycles
+OU_DELAY = 8     # 8s between each city — looks like human browsing
 
+# ─────────────────────────────────────────────
+# CRAIGSLIST — 17 cities
+# ─────────────────────────────────────────────
 CL_CITIES = {
     "Phoenix":          "phoenix",
     "Los Angeles":      "losangeles",
@@ -43,6 +53,9 @@ CL_CITIES = {
     "Dallas":           "dallas",
 }
 
+# ─────────────────────────────────────────────
+# OFFERUP — 27 cities by zip code
+# ─────────────────────────────────────────────
 OU_CITIES = {
     "San Francisco":  "94102",
     "Los Angeles":    "90001",
@@ -84,21 +97,19 @@ OU_HEADERS = {
 OU_BASE = "https://offerup.com/api/search/"
 
 # ─────────────────────────────────────────────
-# LOGGING — DEBUG level so you see everything
+# LOGGING
 # ─────────────────────────────────────────────
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 log = logging.getLogger(__name__)
-
-# Quiet down noisy libraries
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 
 # ─────────────────────────────────────────────
-# SEEN IDs
+# SEEN IDs — APPEND ONLY
 # ─────────────────────────────────────────────
 def load_seen_ids() -> set:
     if os.path.exists(DB_FILE):
@@ -142,9 +153,9 @@ async def send_alert(app, city_label, title, link, price, source):
     log.info("✅ SENT [%s | %s]: %s", city_label, source.upper(), title)
 
 # ─────────────────────────────────────────────
-# CRAIGSLIST LOOP — with debug output
+# CRAIGSLIST LOOP
 # ─────────────────────────────────────────────
-def _fetch_feed(url):
+def _fetch_feed(url: str):
     return feedparser.parse(url)
 
 async def craigslist_loop(app):
@@ -161,10 +172,7 @@ async def craigslist_loop(app):
             for url, feed_type in feeds:
                 try:
                     feed = await loop.run_in_executor(None, partial(_fetch_feed, url))
-                    entry_count = len(feed.entries)
-
-                    # DEBUG: tells you exactly how many entries came back per feed
-                    log.debug("CL [%s | %s] → %d entries", city_label, feed_type, entry_count)
+                    log.info("CL [%s | %s] → %d entries", city_label, feed_type, len(feed.entries))
 
                     new_count = 0
                     for entry in feed.entries:
@@ -195,9 +203,9 @@ async def craigslist_loop(app):
         await asyncio.sleep(CL_SLEEP)
 
 # ─────────────────────────────────────────────
-# OFFERUP LOOP — with debug output
+# OFFERUP LOOP
 # ─────────────────────────────────────────────
-async def fetch_offerup_city(client, city_label, zipcode, app):
+async def fetch_offerup_city(client: httpx.AsyncClient, city_label: str, zipcode: str, app):
     params = {
         "zip":                 zipcode,
         "radius":              30,
@@ -205,14 +213,8 @@ async def fetch_offerup_city(client, city_label, zipcode, app):
         "sort":                "date",
         "delivery_preference": "local",
     }
-
     try:
         resp = await client.get(OU_BASE, params=params, headers=OU_HEADERS, timeout=20)
-
-        # DEBUG: log the raw HTTP status + first 500 chars of response
-        log.debug("OU [%s | zip=%s] → HTTP %s", city_label, zipcode, resp.status_code)
-        log.debug("OU [%s] RAW RESPONSE: %s", city_label, resp.text[:500])
-
         resp.raise_for_status()
         data = resp.json()
 
@@ -222,7 +224,7 @@ async def fetch_offerup_city(client, city_label, zipcode, app):
             or []
         )
 
-        log.debug("OU [%s | zip=%s] → %d items returned", city_label, zipcode, len(items))
+        log.info("OU [%s | zip=%s] → %d items", city_label, zipcode, len(items))
 
         new_count = 0
         for item in items:
@@ -253,18 +255,17 @@ async def fetch_offerup_city(client, city_label, zipcode, app):
             log.info("OU [%s] → %d NEW alerts sent", city_label, new_count)
 
     except httpx.HTTPStatusError as e:
-        log.error("OU HTTP ERROR [%s | zip=%s]: status %s — %s",
-                  city_label, zipcode, e.response.status_code, e.response.text[:300])
+        log.error("OU HTTP ERROR [%s | zip=%s]: %s", city_label, zipcode, e.response.status_code)
     except Exception as e:
         log.error("OU ERROR [%s | zip=%s]: %s", city_label, zipcode, e)
 
 async def offerup_loop(app):
-    log.info("✅ OfferUp loop started — %d cities.", len(OU_CITIES))
+    log.info("✅ OfferUp loop started — %d cities, %ds between each.", len(OU_CITIES), OU_DELAY)
     async with httpx.AsyncClient() as client:
         while True:
             for city_label, zipcode in OU_CITIES.items():
                 await fetch_offerup_city(client, city_label, zipcode, app)
-                await asyncio.sleep(2)
+                await asyncio.sleep(OU_DELAY)  # 8s between cities = human-like pace
             log.info("📲 OU cycle done. Sleeping %ds...", OU_SLEEP)
             await asyncio.sleep(OU_SLEEP)
 
@@ -273,10 +274,10 @@ async def offerup_loop(app):
 # ─────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "✅ *Virtual Broker Bot v4 DEBUG is live.*\n\n"
-        f"🚗 Craigslist: {len(CL_CITIES)} cities\n"
-        f"📲 OfferUp: {len(OU_CITIES)} cities\n\n"
-        "Watch Railway logs for debug output.",
+        "✅ *Virtual Broker Bot v5 is live.*\n\n"
+        f"🚗 Craigslist: {len(CL_CITIES)} cities | Every {CL_SLEEP}s\n"
+        f"📲 OfferUp: {len(OU_CITIES)} cities | Every {OU_SLEEP}s | {OU_DELAY}s between cities\n\n"
+        "Commands:\n/start — this message\n/status — seen count",
         parse_mode="Markdown"
     )
 
@@ -304,7 +305,7 @@ def main():
     )
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
-    log.info("🤖 Virtual Broker Bot v4 DEBUG starting...")
+    log.info("🤖 Virtual Broker Bot v5 starting...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
