@@ -1,2 +1,3 @@
-feedparser
-requests
+requests==2.31.0
+feedparser==6.0.11
+pyTelegramBotAPI==4.15.4
