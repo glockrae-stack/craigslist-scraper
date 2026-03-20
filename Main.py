@@ -1,8 +1,9 @@
 """
-Virtual Broker Bot v5
+Virtual Broker Bot v5 — FINAL
 ─────────────────────────────────────────────
 - Craigslist: 17 cities via RSS (cto + boo + zip) — every 90s
 - OfferUp:    27 cities via mobile API — every 5 mins, 8s between cities
+- WebShare rotating proxies — bypasses Railway geo-block
 - seen_ids.txt is append-only (survives Railway restarts)
 
 Install:
@@ -16,6 +17,7 @@ import os
 import re
 import logging
 import random
+import urllib.request
 from functools import partial
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -28,7 +30,25 @@ CHAT_ID  = "6549307194"
 DB_FILE  = "seen_ids.txt"
 CL_SLEEP = 90    # Craigslist: 90s between full cycles
 OU_SLEEP = 300   # OfferUp: 5 mins between full cycles
-OU_DELAY = 8     # 8s between each city — looks like human browsing
+OU_DELAY = 8     # 8s between each OfferUp city — looks human
+
+# ─────────────────────────────────────────────
+# WEBSHARE PROXIES
+# All 5 rotate randomly — if one gets flagged others keep running
+# To refresh: webshare.io → Proxy → List → swap IPs below
+# ─────────────────────────────────────────────
+PROXY_USER = "oyexvpgk"
+PROXY_PASS = "tde8ndie2iu8"
+PROXY_LIST = [
+    f"http://{PROXY_USER}:{PROXY_PASS}@23.95.150.145:6114",
+    f"http://{PROXY_USER}:{PROXY_PASS}@198.23.239.134:6540",
+    f"http://{PROXY_USER}:{PROXY_PASS}@107.172.163.27:6543",
+    f"http://{PROXY_USER}:{PROXY_PASS}@216.10.27.159:6837",
+    f"http://{PROXY_USER}:{PROXY_PASS}@191.96.254.138:6185",
+]
+
+def get_proxy() -> str:
+    return random.choice(PROXY_LIST)
 
 # ─────────────────────────────────────────────
 # CRAIGSLIST — 17 cities
@@ -154,9 +174,17 @@ async def send_alert(app, city_label, title, link, price, source):
 
 # ─────────────────────────────────────────────
 # CRAIGSLIST LOOP
+# Uses urllib proxy handler since feedparser is sync
 # ─────────────────────────────────────────────
-def _fetch_feed(url: str):
-    return feedparser.parse(url)
+def _fetch_feed(url: str, proxy: str):
+    proxy_handler = urllib.request.ProxyHandler({
+        "http":  proxy,
+        "https": proxy,
+    })
+    opener = urllib.request.build_opener(proxy_handler)
+    response = opener.open(url, timeout=15)
+    content  = response.read()
+    return feedparser.parse(content)
 
 async def craigslist_loop(app):
     loop = asyncio.get_event_loop()
@@ -171,7 +199,8 @@ async def craigslist_loop(app):
             ]
             for url, feed_type in feeds:
                 try:
-                    feed = await loop.run_in_executor(None, partial(_fetch_feed, url))
+                    proxy = get_proxy()
+                    feed  = await loop.run_in_executor(None, partial(_fetch_feed, url, proxy))
                     log.info("CL [%s | %s] → %d entries", city_label, feed_type, len(feed.entries))
 
                     new_count = 0
@@ -204,8 +233,9 @@ async def craigslist_loop(app):
 
 # ─────────────────────────────────────────────
 # OFFERUP LOOP
+# Each city gets a fresh random proxy + 8s delay between cities
 # ─────────────────────────────────────────────
-async def fetch_offerup_city(client: httpx.AsyncClient, city_label: str, zipcode: str, app):
+async def fetch_offerup_city(city_label: str, zipcode: str, app):
     params = {
         "zip":                 zipcode,
         "radius":              30,
@@ -213,10 +243,13 @@ async def fetch_offerup_city(client: httpx.AsyncClient, city_label: str, zipcode
         "sort":                "date",
         "delivery_preference": "local",
     }
+    proxy = get_proxy()
+
     try:
-        resp = await client.get(OU_BASE, params=params, headers=OU_HEADERS, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
+        async with httpx.AsyncClient(proxy=proxy, timeout=20) as client:
+            resp = await client.get(OU_BASE, params=params, headers=OU_HEADERS)
+            resp.raise_for_status()
+            data = resp.json()
 
         items = (
             data.get("data", {}).get("items", [])
@@ -260,14 +293,13 @@ async def fetch_offerup_city(client: httpx.AsyncClient, city_label: str, zipcode
         log.error("OU ERROR [%s | zip=%s]: %s", city_label, zipcode, e)
 
 async def offerup_loop(app):
-    log.info("✅ OfferUp loop started — %d cities, %ds between each.", len(OU_CITIES), OU_DELAY)
-    async with httpx.AsyncClient() as client:
-        while True:
-            for city_label, zipcode in OU_CITIES.items():
-                await fetch_offerup_city(client, city_label, zipcode, app)
-                await asyncio.sleep(OU_DELAY)  # 8s between cities = human-like pace
-            log.info("📲 OU cycle done. Sleeping %ds...", OU_SLEEP)
-            await asyncio.sleep(OU_SLEEP)
+    log.info("✅ OfferUp loop started — %d cities, %ds delay, %ds cycle.", len(OU_CITIES), OU_DELAY, OU_SLEEP)
+    while True:
+        for city_label, zipcode in OU_CITIES.items():
+            await fetch_offerup_city(city_label, zipcode, app)
+            await asyncio.sleep(OU_DELAY)
+        log.info("📲 OU cycle done. Sleeping %ds...", OU_SLEEP)
+        await asyncio.sleep(OU_SLEEP)
 
 # ─────────────────────────────────────────────
 # COMMANDS
@@ -276,7 +308,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✅ *Virtual Broker Bot v5 is live.*\n\n"
         f"🚗 Craigslist: {len(CL_CITIES)} cities | Every {CL_SLEEP}s\n"
-        f"📲 OfferUp: {len(OU_CITIES)} cities | Every {OU_SLEEP}s | {OU_DELAY}s between cities\n\n"
+        f"📲 OfferUp: {len(OU_CITIES)} cities | Every {OU_SLEEP}s\n"
+        f"🔒 US proxies rotating on every request\n\n"
         "Commands:\n/start — this message\n/status — seen count",
         parse_mode="Markdown"
     )
