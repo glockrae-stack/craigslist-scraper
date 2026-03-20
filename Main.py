@@ -1,14 +1,15 @@
 import os
-import time
 import random
 import urllib.parse
-import requests
 import sqlite3
 import feedparser
-import threading
+import asyncio
+import aiohttp
 from datetime import datetime
-import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+# python-telegram-bot components
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # ==========================================
 # CONFIGURATION & CREDENTIALS
@@ -16,14 +17,14 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8761442506:AAFPCQyaKuSbjuc4s8SwzKYvMAFHQ5QlgXY")
 CHAT_ID = os.getenv("CHAT_ID", "6549307194")
 
-# Initialize the TeleBot instance
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
-
 # Railway Persistent Volume Mapping
 DB_PATH = "/app/data/deals.db" if os.path.exists("/app/data") else "deals.db"
 
+# Global state for the /status command
+LAST_SCAN_TIME = "Initializing..."
+
 # ==========================================
-# CITIES & SEARCH CONFIGURATION
+# CITIES & SEARCH CONFIGURATION (Mike Strategy)
 # ==========================================
 CITIES =[
     {"zip": "33101", "subdomain": "miami", "name": "Miami, FL"},
@@ -77,11 +78,10 @@ USER_AGENTS =[
 ]
 
 # ==========================================
-# TELEGRAM BOT COMMANDS (THREAD 1 - FOREGROUND)
+# 1. TELEGRAM ASYNC COMMAND HANDLERS
 # ==========================================
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    """Handles the /start command."""
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Triggered when user sends /start"""
     welcome_text = (
         "🦅 <b>Mike Strategy Arbitrage System Initialized.</b>\n\n"
         "Welcome to your High-Ticket Lead Generation hub. I am currently operating in the background, "
@@ -89,31 +89,33 @@ def send_welcome(message):
         "<i>Ready to secure the bag.</i> 💰"
     )
     
-    # Create the inline button
-    markup = InlineKeyboardMarkup()
-    btn = InlineKeyboardButton("📡 Check Connection", callback_data="ping_server")
-    markup.add(btn)
+    keyboard = [[InlineKeyboardButton("📟 Check System Status", callback_data="check_status")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
-    bot.send_message(message.chat.id, welcome_text, parse_mode="HTML", reply_markup=markup)
+    await update.message.reply_text(welcome_text, parse_mode="HTML", reply_markup=reply_markup)
 
-@bot.message_handler(commands=['ping'])
-def send_ping(message):
-    """Handles the /ping command."""
-    server_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    bot.reply_to(message, f"🏓 <b>Pong! System is Live.</b>\n🕒 Server Time: {server_time}", parse_mode="HTML")
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Triggered by /status OR clicking the Check Status button"""
+    global LAST_SCAN_TIME
+    status_text = (
+        f"✅ <b>System Online.</b>\n"
+        f"📍 Scanning 28 Cities.\n"
+        f"🕒 Last scan: {LAST_SCAN_TIME}"
+    )
 
-@bot.callback_query_handler(func=lambda call: call.data == "ping_server")
-def handle_ping_callback(call):
-    """Handles the button press from the /start menu."""
-    server_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    bot.answer_callback_query(call.id, "Connection solid. 🟢")
-    bot.send_message(call.message.chat.id, f"🏓 <b>Pong! System is Live.</b>\n🕒 Server Time: {server_time}", parse_mode="HTML")
+    if update.callback_query:
+        # If it was a button click
+        await update.callback_query.answer("Status Refreshed 🟢")
+        await update.callback_query.message.reply_text(status_text, parse_mode="HTML")
+    elif update.message:
+        # If it was a direct /status command
+        await update.message.reply_text(status_text, parse_mode="HTML")
 
 # ==========================================
-# DATABASE & SCRAPING LOGIC (THREAD 2 - BACKGROUND)
+# 2. CORE SCRAPING & GRADING LOGIC
 # ==========================================
 def setup_database():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("CREATE TABLE IF NOT EXISTS seen_deals (link TEXT PRIMARY KEY)")
     conn.commit()
@@ -155,8 +157,8 @@ def grade_deal(price, est_market_price, title, description, image_url):
     else:
         return "Grade D", False
 
-def send_deal_alert(item):
-    """Pushes a scraped deal to Telegram using the TeleBot instance."""
+async def send_deal_alert(bot, item):
+    """Pushes the deal UI to Telegram"""
     caption = (
         f"<b>{item['grade']} ALERT</b>\n\n"
         f"<b>Item:</b> {item['title']}\n"
@@ -166,94 +168,106 @@ def send_deal_alert(item):
         f"<b>Search Match:</b> <i>'{item['query'].title()}'</i>"
     )
 
-    markup = InlineKeyboardMarkup()
-    btn = InlineKeyboardButton("👀 View Deal", url=item['link'])
-    markup.add(btn)
+    keyboard = [[InlineKeyboardButton("👀 View Deal", url=item['link'])]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
     try:
         if item['image_url']:
-            bot.send_photo(CHAT_ID, item['image_url'], caption=caption, parse_mode="HTML", reply_markup=markup)
+            await bot.send_photo(chat_id=CHAT_ID, photo=item['image_url'], caption=caption, parse_mode="HTML", reply_markup=reply_markup)
         else:
-            bot.send_message(CHAT_ID, caption, parse_mode="HTML", reply_markup=markup)
+            await bot.send_message(chat_id=CHAT_ID, text=caption, parse_mode="HTML", reply_markup=reply_markup)
     except Exception as e:
-        print(f"Failed to send deal to Telegram: {e}")
+        print(f"Failed to send alert: {e}")
 
-def background_scraper_loop():
-    """This function runs indefinitely in a separate thread."""
+# ==========================================
+# 3. ASYNC BACKGROUND SCRAPER LOOP
+# ==========================================
+async def background_scraper_loop(app: Application):
+    """This runs continuously in the background using asyncio"""
+    global LAST_SCAN_TIME
     conn = setup_database()
     c = conn.cursor()
     
-    print("[Thread-2] Background Scraper Initialized.")
+    print("Background Scraper task initialized.")
     
-    while True:
-        print("\n[Thread-2] Starting new sweep of 28 cities...")
-        for city in CITIES:
-            for config in SEARCH_CONFIG:
-                query_encoded = urllib.parse.quote(config['query'])
-                rss_url = f"https://{city['subdomain']}.craigslist.org/search/{config['category']}?query={query_encoded}&format=rss"
-                headers = {"User-Agent": random.choice(USER_AGENTS)}
-                
-                try:
-                    response = requests.get(rss_url, headers=headers, timeout=15)
-                    feed = feedparser.parse(response.content)
+    # We use aiohttp for NON-BLOCKING web requests!
+    async with aiohttp.ClientSession() as session:
+        while True:
+            LAST_SCAN_TIME = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"\nStarting sweep at {LAST_SCAN_TIME}...")
+            
+            for city in CITIES:
+                for config in SEARCH_CONFIG:
+                    query_encoded = urllib.parse.quote(config['query'])
+                    rss_url = f"https://{city['subdomain']}.craigslist.org/search/{config['category']}?query={query_encoded}&format=rss"
+                    headers = {"User-Agent": random.choice(USER_AGENTS)}
+                    
+                    try:
+                        # Non-blocking GET request
+                        async with session.get(rss_url, headers=headers, timeout=15) as response:
+                            content = await response.read()
+                            feed = feedparser.parse(content)
 
-                    for entry in feed.entries:
-                        link = entry.link
-                        title = entry.title
-                        description = getattr(entry, 'summary', '')
+                            for entry in feed.entries:
+                                link = entry.link
+                                title = entry.title
+                                description = getattr(entry, 'summary', '')
 
-                        c.execute("SELECT link FROM seen_deals WHERE link=?", (link,))
-                        if c.fetchone() is None:
-                            price = extract_price(title)
-                            image_url = extract_image_url(entry)
-                            
-                            grade, is_worthy = grade_deal(price, config['est_market_price'], title, description, image_url)
+                                c.execute("SELECT link FROM seen_deals WHERE link=?", (link,))
+                                if c.fetchone() is None:
+                                    price = extract_price(title)
+                                    image_url = extract_image_url(entry)
+                                    
+                                    grade, is_worthy = grade_deal(price, config['est_market_price'], title, description, image_url)
 
-                            if is_worthy:
-                                item = {
-                                    "title": title,
-                                    "price": price,
-                                    "market_value": config['est_market_price'],
-                                    "link": link,
-                                    "city_name": city['name'],
-                                    "zip": city['zip'],
-                                    "query": config['query'],
-                                    "image_url": image_url,
-                                    "grade": grade
-                                }
-                                print(f"[Thread-2] Found {grade} deal in {city['name']}!")
-                                send_deal_alert(item)
+                                    if is_worthy:
+                                        item = {
+                                            "title": title,
+                                            "price": price,
+                                            "market_value": config['est_market_price'],
+                                            "link": link,
+                                            "city_name": city['name'],
+                                            "zip": city['zip'],
+                                            "query": config['query'],
+                                            "image_url": image_url,
+                                            "grade": grade
+                                        }
+                                        print(f"Found {grade} deal in {city['name']}!")
+                                        await send_deal_alert(app.bot, item)
 
-                            c.execute("INSERT INTO seen_deals (link) VALUES (?)", (link,))
-                            conn.commit()
+                                    c.execute("INSERT INTO seen_deals (link) VALUES (?)", (link,))
+                                    conn.commit()
 
-                except Exception as e:
-                    print(f"[Thread-2] Network error on {city['name']} for '{config['query']}': {e}")
+                    except Exception as e:
+                        print(f"Network error on {city['name']} for '{config['query']}': {e}")
 
-                # Human Jitter Delay
-                time.sleep(random.uniform(15.0, 45.0))
-        
-        print("[Thread-2] Full sweep complete. Sleeping for 45 minutes to reset IP reputation...")
-        time.sleep(2700)
+                    # NON-BLOCKING Jitter Delay (15-45s) - The Bot still listens during this sleep!
+                    await asyncio.sleep(random.uniform(15.0, 45.0))
+            
+            print("Full sweep complete. Sleeping for 45 minutes to reset IP reputation...")
+            await asyncio.sleep(2700)
+
+async def post_init(app: Application):
+    """This hook starts the background scraper right after the bot boots up"""
+    asyncio.create_task(background_scraper_loop(app))
 
 # ==========================================
-# SYSTEM BOOT (TYING THE THREADS TOGETHER)
+# 4. SYSTEM BOOT
 # ==========================================
 if __name__ == "__main__":
-    print("System booting up...")
+    print("Building Async Application...")
     
-    # 1. Start the Scraper in a daemon thread (runs independently in the background)
-    scraper_thread = threading.Thread(target=background_scraper_loop, daemon=True)
-    scraper_thread.start()
+    # Build the Application
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     
-    # 2. Start the Telegram Bot poller on the main thread
-    print("[Thread-1] Telegram Bot Listener Online. Waiting for commands...")
+    # Add Command Handlers
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("status", status_command))
     
-    # Send an initial boot message to your phone
-    try:
-        bot.send_message(CHAT_ID, "🔄 <b>Server Rebooted.</b>\nBot is online and background scraper has started.", parse_mode="HTML")
-    except:
-        pass
-
-    # infinity_polling keeps the script running and listening to Telegram without freezing
-    bot.infinity_polling(timeout=10, long_polling_timeout=5)
+    # Add Button Click Handler
+    app.add_handler(CallbackQueryHandler(status_command, pattern="^check_status$"))
+    
+    print("Bot Listener Online. Running Event Loop...")
+    
+    # Run the bot! (This handles the event loop and keeps the script alive)
+    app.run_polling(drop_pending_updates=True)
