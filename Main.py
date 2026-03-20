@@ -228,9 +228,24 @@ def scrape_craigslist():
             # ==========================================
             sleep_time = random.uniform(15.0, 45.0)
             time.sleep(sleep_time)
-
+def send_startup_message():
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": "🤖 <b>Mike Strategy Bot Online!</b>\n\nI am now running in the background and scanning 28 cities. I will alert you here as soon as I find a heavily discounted deal. 🚀",
+        "parse_mode": "HTML"
+    }
+    requests.post(url, json=payload)
 if __name__ == "__main__":
     print("Mike Strategy Arbitrage Bot Initiated.")
+    while True:
+        scrape_craigslist()
+        print("Full sweep complete. Sleeping for 45 minutes to reset IP reputation...")
+        time.sleep(2700)
+if __name__ == "__main__":
+    print("Mike Strategy Arbitrage Bot Initiated.")
+    send_startup_message()  # <--- This forces the bot to text you when it turns on!
+    
     while True:
         scrape_craigslist()
         print("Full sweep complete. Sleeping for 45 minutes to reset IP reputation...")
