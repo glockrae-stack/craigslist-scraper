@@ -1,66 +1,246 @@
 import asyncio
 import feedparser
 import logging
+from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-# --- YOUR RECALLED DATA ---
+# ============================================================
+# CREDENTIALS
+# ============================================================
 TOKEN = "8761442506:AAFPCQyaKuSbjuc4s8SwzKYvMAFHQ5QlgXY"
 CHAT_ID = "6549307194"
 
-CITIES = ["phoenix", "losangeles", "sandiego", "sfbay", "cosprings", "washingtondc", "atlanta", "chicago", "neworleans", "boston", "detroit", "minneapolis", "lasvegas", "albuquerque", "newyork", "portland", "dallas"]
-FURNITURE = ["couch", "sofa", "dresser", "tv stand", "table"]
-HIGH_TICKET = ["boat", "center console", "honda", "toyota", "jet ski"]
-DISTRESS = ["must sell", "divorce", "moving", "cash only", "needs gone"]
-NEGATIVES = ["curb alert", "on the curb", "broken", "damaged", "junk", "medical", "wheelchair", "animal"]
+# ============================================================
+# THE 17 HIGH-VELOCITY MARKETS
+# ============================================================
+CITIES = [
+    "phoenix", "losangeles", "sandiego", "sfbay", "cosprings",
+    "washingtondc", "atlanta", "chicago", "neworleans", "boston",
+    "detroit", "minneapolis", "lasvegas", "albuquerque", "newyork",
+    "portland", "dallas"
+]
 
-logging.basicConfig(level=logging.INFO)
+# ============================================================
+# FILTERS
+# ============================================================
+ASSETS    = ["boat", "center console", "skiff", "outboard", "honda", "toyota",
+             "lexus", "jet ski", "yamaha", "seadoo", "camry", "accord"]
+DISTRESS  = ["must sell", "divorce", "moving", "cash only", "negotiable",
+             "needs gone", "motivated", "estate sale", "title in hand", "obo",
+             "relocating", "price drop", "make offer"]
+FURNITURE = ["couch", "sofa", "sectional", "dresser", "tv stand", "dining table",
+             "recliner", "loveseat", "bedroom set"]
+NEGATIVES = ["curb alert", "on the curb", "broken", "damaged", "junk",
+             "medical", "wheelchair", "animal", "parts only"]
 
+# ============================================================
+# STATE
+# ============================================================
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO
+)
+seen_ids      = set()
+scan_active   = True
+leads_found   = 0
+scan_count    = 0
+start_time    = datetime.now()
+
+# ============================================================
+# MAIN MENU KEYBOARD
+# ============================================================
+def main_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📡 Ping Bot",        callback_data="ping"),
+         InlineKeyboardButton("📊 Stats",           callback_data="stats")],
+        [InlineKeyboardButton("⏸ Pause Scanner",   callback_data="pause"),
+         InlineKeyboardButton("▶️ Resume Scanner",  callback_data="resume")],
+        [InlineKeyboardButton("🧹 Clear Memory",    callback_data="clear"),
+         InlineKeyboardButton("🏙 Cities List",     callback_data="cities")],
+        [InlineKeyboardButton("💡 Strategy Info",   callback_data="strategy")],
+    ])
+
+# ============================================================
+# COMMANDS
+# ============================================================
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🚀 *MONEY MAGNET ONLINE*\n\n"
+        "Scanning *17 cities* every 10 minutes.\n"
+        "Hunting distressed assets + free furniture flips.\n\n"
+        "Pick an option:",
+        parse_mode="Markdown",
+        reply_markup=main_menu()
+    )
+
+async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uptime = str(datetime.now() - start_time).split(".")[0]
+    state  = "▶️ ACTIVE" if scan_active else "⏸ PAUSED"
+    await update.message.reply_text(
+        f"🤖 *BOT STATUS*\n\n"
+        f"Scanner: {state}\n"
+        f"Uptime: `{uptime}`\n"
+        f"Scans run: `{scan_count}`\n"
+        f"Leads found: `{leads_found}`\n"
+        f"Memory (seen IDs): `{len(seen_ids)}`",
+        parse_mode="Markdown",
+        reply_markup=main_menu()
+    )
+
+# ============================================================
+# BUTTON HANDLER
+# ============================================================
+async def button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global scan_active, leads_found, seen_ids
+    q = update.callback_query
+    await q.answer()
+
+    if q.data == "ping":
+        await q.edit_message_text(
+            "✅ *PONG!* Bot is alive and running.",
+            parse_mode="Markdown",
+            reply_markup=main_menu()
+        )
+
+    elif q.data == "stats":
+        uptime = str(datetime.now() - start_time).split(".")[0]
+        state  = "▶️ ACTIVE" if scan_active else "⏸ PAUSED"
+        await q.edit_message_text(
+            f"📊 *LIVE STATS*\n\n"
+            f"Scanner: {state}\n"
+            f"Uptime: `{uptime}`\n"
+            f"Scans completed: `{scan_count}`\n"
+            f"Total leads sent: `{leads_found}`\n"
+            f"Memory (seen IDs): `{len(seen_ids)}`\n"
+            f"Cities monitored: `{len(CITIES)}`",
+            parse_mode="Markdown",
+            reply_markup=main_menu()
+        )
+
+    elif q.data == "pause":
+        scan_active = False
+        await q.edit_message_text(
+            "⏸ *Scanner paused.*\nNo alerts will be sent until you resume.",
+            parse_mode="Markdown",
+            reply_markup=main_menu()
+        )
+
+    elif q.data == "resume":
+        scan_active = True
+        await q.edit_message_text(
+            "▶️ *Scanner resumed.*\nBack on the hunt.",
+            parse_mode="Markdown",
+            reply_markup=main_menu()
+        )
+
+    elif q.data == "clear":
+        seen_ids.clear()
+        await q.edit_message_text(
+            "🧹 *Memory cleared.*\nAll listings will re-scan fresh next cycle.",
+            parse_mode="Markdown",
+            reply_markup=main_menu()
+        )
+
+    elif q.data == "cities":
+        city_list = "\n".join(f"• {c}" for c in CITIES)
+        await q.edit_message_text(
+            f"🏙 *MONITORED CITIES ({len(CITIES)})*\n\n{city_list}",
+            parse_mode="Markdown",
+            reply_markup=main_menu()
+        )
+
+    elif q.data == "strategy":
+        await q.edit_message_text(
+            "💡 *MIKE STRATEGY*\n\n"
+            "1️⃣ Scan distressed sellers (divorce, moving, must sell)\n"
+            "2️⃣ Target high-ticket assets (boats, cars, jet skis)\n"
+            "3️⃣ Lock in with DocuSign Purchase Agreement\n"
+            "4️⃣ Flip contract or wholesale — never touch the asset\n\n"
+            "🆓 *FREE SCALP:* Grab furniture, resell same day.\n\n"
+            "_Motivation > Price. Always._",
+            parse_mode="Markdown",
+            reply_markup=main_menu()
+        )
+
+# ============================================================
+# SCAN ENGINE
+# ============================================================
 async def scan_loop(app):
-    """The Manual 10-Minute Engine"""
-    while True:
-        logging.info("--- Starting Multi-Market Scan ---")
-        for city in CITIES:
-            # 1. Low Ticket (FREE)
-            f_url = f"https://{city}.craigslist.org/search/zip?format=rss"
-            f_feed = feedparser.parse(f_url)
-            for e in f_feed.entries[:5]:
-                title = e.title.lower()
-                desc = e.summary.lower()
-                if any(k in title for k in FURNITURE) and not any(n in title or n in desc for n in NEGATIVES):
-                    msg = f"🆓 **FREE DEAL FOUND**\n\n**{e.title}**\n📍 {city.upper()}\n\n[🚀 VIEW LISTING]({e.link})"
-                    await app.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
+    global scan_active, leads_found, scan_count, seen_ids
 
-            # 2. High Ticket (DISTRESS)
-            s_url = f"https://{city}.craigslist.org/search/sss?format=rss"
-            s_feed = feedparser.parse(s_url)
-            for e in s_feed.entries[:5]:
-                title = e.title.lower()
-                desc = e.summary.lower()
-                if any(h in title for h in HIGH_TICKET) and any(d in desc for d in DISTRESS):
-                    msg = f"💰 **HIGH TICKET DISTRESS**\n\n**{e.title}**\n📍 {city.upper()}\n\n[🚀 VIEW LISTING]({e.link})"
-                    await app.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode='Markdown')
-        
-        logging.info("Scan complete. Waiting 10 minutes.")
+    while True:
+        if scan_active:
+            logging.info(f"--- SCAN #{scan_count + 1} STARTING ---")
+            for city in CITIES:
+                try:
+                    # HIGH-TICKET: distressed assets
+                    s = feedparser.parse(f"https://{city}.craigslist.org/search/sss?format=rss")
+                    for e in s.entries:
+                        if e.id in seen_ids:
+                            continue
+                        text = (e.title + " " + getattr(e, "summary", "")).lower()
+                        if any(a in text for a in ASSETS) and any(d in text for d in DISTRESS):
+                            msg = (
+                                f"💰 *MIKE STRATEGY: HIGH-TICKET LEAD*\n"
+                                f"📍 {city.upper()}\n"
+                                f"📝 {e.title}\n"
+                                f"🔗 {e.link}\n\n"
+                                f"⚡ _Seller is distressed. Send DocuSign PA now._"
+                            )
+                            await app.bot.send_message(CHAT_ID, msg, parse_mode="Markdown")
+                            leads_found += 1
+                        seen_ids.add(e.id)
+
+                    # FREE SCALP: furniture
+                    f = feedparser.parse(f"https://{city}.craigslist.org/search/zip?format=rss")
+                    for e in f.entries:
+                        if e.id in seen_ids:
+                            continue
+                        t = e.title.lower()
+                        if any(k in t for k in FURNITURE) and not any(n in t for n in NEGATIVES):
+                            msg = (
+                                f"🆓 *FREE SCALP: {city.upper()}*\n"
+                                f"📝 {e.title}\n"
+                                f"🔗 {e.link}"
+                            )
+                            await app.bot.send_message(CHAT_ID, msg, parse_mode="Markdown")
+                            leads_found += 1
+                        seen_ids.add(e.id)
+
+                except Exception as ex:
+                    logging.warning(f"Error in {city}: {ex}")
+                    continue
+
+            scan_count += 1
+
+            # Memory guard for Railway Hobby tier
+            if len(seen_ids) > 3000:
+                seen_ids.clear()
+                logging.info("Memory cleared — hit 3000 ID limit.")
+
+            logging.info(f"Scan #{scan_count} done. Sleeping 10m. Total leads: {leads_found}")
+
         await asyncio.sleep(600)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ **MONEY MAGNET ONLINE.**\n\nRecall check: 17 Cities, Low + High Ticket logic is active.")
-
+# ============================================================
+# ENTRY POINT
+# ============================================================
 async def main():
     app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    
-    # Manual Startup
+
+    app.add_handler(CommandHandler("start",  start))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CallbackQueryHandler(button))
+
     await app.initialize()
     await app.start()
-    
-    # This starts the scan in the background without needing the Job Queue library
+
     asyncio.create_task(scan_loop(app))
-    
-    print("--- BOT IS POLLING ---")
-    await app.updater.start_polling()
+
+    logging.info("=== MONEY MAGNET ONLINE ===")
+    await app.updater.start_polling(drop_pending_updates=True)
     await asyncio.Event().wait()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     asyncio.run(main())
