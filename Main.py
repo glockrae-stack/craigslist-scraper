@@ -1,9 +1,9 @@
 """
 Virtual Broker Bot — main.py
 ─────────────────────────────────────────────
-Craigslist: RSS feeds (cto + boo + zip) — 17 cities
-OfferUp:    Deep links (cars, boats, free) — click to browse newest pickup
-1000+ alerts/day target via async + 3s random delay
+Craigslist:  Individual alert per listing (title, price, mileage, city)
+OfferUp:     Individual alert per city+category (direct deep link, same format)
+Both fire the same clean alert format with ⚡ OPEN PULSE button.
 """
 
 import asyncio
@@ -22,12 +22,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 TOKEN   = "8761442506:AAFPCQyaKuSbjuc4s8SwzKYvMAFHQ5QlgXY"
 CHAT_ID = "6549307194"
 DB_FILE = "seen_ids.txt"
-SLEEP   = 90  # seconds between full CL cycles
 
-# ─────────────────────────────────────────────
-# HEADERS — spoofs a real browser so Railway
-# doesn't get 403'd by Craigslist
-# ─────────────────────────────────────────────
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -41,7 +36,7 @@ HEADERS = {
 # ─────────────────────────────────────────────
 # CITIES
 # ─────────────────────────────────────────────
-CITIES = {
+CL_CITIES = {
     "Phoenix":          "phoenix",
     "Los Angeles":      "losangeles",
     "San Diego":        "sandiego",
@@ -61,19 +56,7 @@ CITIES = {
     "Dallas":           "dallas",
 }
 
-# OfferUp search queries per city
-# &delivery_param=p = pickup only, &sort=-p = newest first
-OU_QUERIES = ["cars", "boats", "free"]
-
-def offerup_link(city_slug: str, query: str) -> str:
-    return (
-        f"https://offerup.com/search/"
-        f"?q={query}&location={city_slug}"
-        f"&delivery_param=p&sort=-p"
-    )
-
-# OfferUp city slugs for deep links
-OU_SLUGS = {
+OU_CITIES = {
     "Phoenix":          "phoenix-az",
     "Los Angeles":      "los-angeles-ca",
     "San Diego":        "san-diego-ca",
@@ -92,6 +75,16 @@ OU_SLUGS = {
     "Portland":         "portland-or",
     "Dallas":           "dallas-tx",
 }
+
+# OfferUp categories — cars, boats, free
+OU_CATEGORIES = {
+    "cars":  ("🚗 CARS BY OWNER",  "cars"),
+    "boats": ("⛵ BOATS BY OWNER", "boats"),
+    "free":  ("🆓 FREE STUFF",     "free"),
+}
+
+def ou_link(slug: str, query: str) -> str:
+    return f"https://offerup.com/search/?q={query}&location={slug}&delivery_param=p&sort=-p"
 
 # ─────────────────────────────────────────────
 # LOGGING
@@ -113,15 +106,15 @@ def load_seen_ids() -> set:
             return set(line.strip() for line in f if line.strip())
     return set()
 
-def mark_seen(listing_id: str):
+def mark_seen(lid: str):
     with open(DB_FILE, "a") as f:
-        f.write(f"{listing_id}\n")
+        f.write(f"{lid}\n")
 
 seen_ids = load_seen_ids()
 log.info("Loaded %d seen IDs", len(seen_ids))
 
 # ─────────────────────────────────────────────
-# HELPERS
+# PARSERS
 # ─────────────────────────────────────────────
 def extract_price(text: str) -> str:
     paren = re.search(r'\(\s*(\$[\d,]+)\s*\)', text)
@@ -132,38 +125,55 @@ def extract_price(text: str) -> str:
         return bare.group(0)
     return ""
 
-async def send_alert(app, title: str, link: str, city_label: str):
-    price     = extract_price(title)
-    price_str = f"💰 {price} | " if price else ""
+def extract_mileage(text: str) -> str:
+    patterns = [
+        r'odometer[:\s]+([0-9,]+)',
+        r'([0-9,]+)\s*(?:miles|mi\b)',
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            raw = m.group(1).replace(",", "")
+            try:
+                return f"{int(raw):,} mi"
+            except:
+                pass
+    return ""
 
-    msg = (
-        f"*{title.upper()}*\n"
-        f"{price_str}🏙️ {city_label}"
-    )
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("⚡ OPEN PULSE", url=link)
-    ]])
+# ─────────────────────────────────────────────
+# ALERT SENDER
+# ─────────────────────────────────────────────
+async def send_alert(app, title: str, link: str, city: str, price: str = "", mileage: str = ""):
+    parts = []
+    if price:
+        parts.append(f"💰 {price}")
+    if mileage:
+        parts.append(f"🛣️ {mileage}")
+    parts.append(f"🏙️ {city}")
+
+    msg = f"*{title.upper()}*\n{' • '.join(parts)}"
+    kb  = InlineKeyboardMarkup([[InlineKeyboardButton("⚡ OPEN PULSE", url=link)]])
+
     await app.bot.send_message(
         CHAT_ID, msg,
         parse_mode="Markdown",
         reply_markup=kb,
         disable_web_page_preview=True
     )
-    log.info("✅ SENT [%s]: %s", city_label, title[:60])
+    log.info("✅ [%s] %s", city, title[:60])
 
 # ─────────────────────────────────────────────
 # CRAIGSLIST LOOP
-# feedparser with browser User-Agent header
 # ─────────────────────────────────────────────
-def _fetch_feed(url: str) -> object:
+def _fetch_feed(url: str):
     return feedparser.parse(url, request_headers=HEADERS)
 
 async def craigslist_loop(app):
     loop = asyncio.get_event_loop()
-    log.info("✅ Craigslist loop started — %d cities", len(CITIES))
+    log.info("✅ Craigslist loop started — %d cities", len(CL_CITIES))
 
     while True:
-        for city_label, cl_slug in CITIES.items():
+        for city_label, cl_slug in CL_CITIES.items():
             feeds = [
                 (f"https://{cl_slug}.craigslist.org/search/cto?format=rss", "cars"),
                 (f"https://{cl_slug}.craigslist.org/search/boo?format=rss", "boats"),
@@ -174,72 +184,72 @@ async def craigslist_loop(app):
                     feed = await loop.run_in_executor(None, partial(_fetch_feed, url))
                     log.info("CL [%s | %s] → %d entries", city_label, feed_type, len(feed.entries))
 
-                    new_count = 0
                     for entry in feed.entries:
                         entry_id = getattr(entry, "id", entry.link)
                         if entry_id in seen_ids:
                             continue
+
                         title = entry.title.strip()
 
-                        # ZIP: only fire if 'free' is in the title
                         if feed_type == "free" and "free" not in title.lower():
                             seen_ids.add(entry_id)
                             mark_seen(entry_id)
                             continue
 
-                        await send_alert(app, title, entry.link, city_label)
+                        price   = extract_price(title)
+                        desc    = getattr(entry, "summary", "") or ""
+                        mileage = extract_mileage(desc) if feed_type == "cars" else ""
+
+                        await send_alert(app, title, entry.link, city_label, price, mileage)
                         seen_ids.add(entry_id)
                         mark_seen(entry_id)
-                        new_count += 1
 
-                    if new_count:
-                        log.info("CL [%s | %s] → %d NEW", city_label, feed_type, new_count)
-
-                    # 3s random delay between each feed — stays under radar
                     await asyncio.sleep(random.uniform(2, 4))
 
                 except Exception as e:
                     log.error("CL ERROR [%s | %s]: %s", city_label, feed_type, e)
                     continue
 
-        log.info("🔄 CL cycle done. Sleeping %ds...", SLEEP)
-        await asyncio.sleep(SLEEP)
+        log.info("🔄 CL cycle done. Sleeping 90s...")
+        await asyncio.sleep(90)
 
 # ─────────────────────────────────────────────
-# OFFERUP PULSE LOOP
-# Sends clickable deep links — no scraping,
-# no blocks, forces newest pickup mode in app
+# OFFERUP LOOP
+# One alert per city per category — same format
+# as Craigslist but links straight to OfferUp
+# search filtered to pickup only + newest first
 # ─────────────────────────────────────────────
-async def offerup_pulse_loop(app):
-    log.info("✅ OfferUp pulse loop started")
+async def offerup_loop(app):
+    log.info("✅ OfferUp loop started — %d cities", len(OU_CITIES))
 
     while True:
-        for city_label, ou_slug in OU_SLUGS.items():
-            for query in OU_QUERIES:
-                link     = offerup_link(ou_slug, query)
-                pulse_id = f"ou_pulse_{city_label}_{query}_{asyncio.get_event_loop().time():.0f}"
+        for city_label, slug in OU_CITIES.items():
+            for cat_key, (cat_title, cat_query) in OU_CATEGORIES.items():
+                # Use city+category as ID so it fires once per cycle
+                alert_id = f"ou_{slug}_{cat_key}"
+                if alert_id in seen_ids:
+                    continue
 
-                msg = (
-                    f"🏙️ *OFFERUP PULSE: {city_label.upper()}*\n"
-                    f"🔍 Tap to browse newest *{query.upper()}* — pickup only"
+                link = ou_link(slug, cat_query)
+
+                await send_alert(
+                    app,
+                    title   = f"{cat_title} — {city_label}",
+                    link    = link,
+                    city    = city_label,
                 )
-                kb = InlineKeyboardMarkup([[
-                    InlineKeyboardButton(f"⚡ SCAN OFFERUP: {query.upper()}", url=link)
-                ]])
-                try:
-                    await app.bot.send_message(
-                        CHAT_ID, msg,
-                        parse_mode="Markdown",
-                        reply_markup=kb,
-                        disable_web_page_preview=True
-                    )
-                    log.info("OU PULSE [%s | %s]", city_label, query)
-                except Exception as e:
-                    log.error("OU PULSE ERROR [%s]: %s", city_label, e)
+
+                seen_ids.add(alert_id)
+                mark_seen(alert_id)
 
                 await asyncio.sleep(random.uniform(2, 4))
 
-        log.info("📲 OfferUp pulse cycle done. Sleeping 300s...")
+        log.info("📲 OU cycle done. Sleeping 300s...")
+        # Clear OU seen IDs every cycle so links refresh
+        ou_keys = [k for k in seen_ids if k.startswith("ou_")]
+        for k in ou_keys:
+            seen_ids.discard(k)
+
         await asyncio.sleep(300)
 
 # ─────────────────────────────────────────────
@@ -248,9 +258,8 @@ async def offerup_pulse_loop(app):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⚡ *Virtual Broker Bot is live.*\n\n"
-        f"🚗 Craigslist: {len(CITIES)} cities | CTO + BOO + ZIP\n"
-        f"📲 OfferUp: {len(CITIES)} cities | Pulse links every 5 mins\n"
-        f"🎯 Target: 1,000+ alerts/day\n\n"
+        f"🚗 Craigslist: {len(CL_CITIES)} cities | CTO + BOO + ZIP\n"
+        f"📲 OfferUp: {len(OU_CITIES)} cities | Cars + Boats + Free\n\n"
         "Commands:\n/start — this message\n/status — stats",
         parse_mode="Markdown"
     )
@@ -258,8 +267,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"👀 *{len(seen_ids):,}* listings tracked\n"
-        f"🚗 Craigslist: *{len(CITIES)}* cities\n"
-        f"📲 OfferUp: *{len(CITIES)}* cities | {len(OU_QUERIES)} queries each",
+        f"🚗 Craigslist: *{len(CL_CITIES)}* cities\n"
+        f"📲 OfferUp: *{len(OU_CITIES)}* cities",
         parse_mode="Markdown"
     )
 
@@ -268,7 +277,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────
 async def post_init(app):
     asyncio.create_task(craigslist_loop(app))
-    asyncio.create_task(offerup_pulse_loop(app))
+    asyncio.create_task(offerup_loop(app))
 
 def main():
     app = (
