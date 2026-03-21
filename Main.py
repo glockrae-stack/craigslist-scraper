@@ -26,7 +26,7 @@ PROXIES = [
     "http://oyexvpgk-us-7:tde8ndie2iu8@p.webshare.io:80",
 ]
 
-# CRAIGSLIST TARGETS (Cities)
+# CRAIGSLIST TARGETS
 CL_CITIES = {
     "San Francisco": "sfbay", "Los Angeles": "losangeles", "San Diego": "sandiego",
     "Sacramento": "sacramento", "Seattle": "seattle", "Tampa Bay": "tampa",
@@ -38,7 +38,7 @@ CL_CITIES = {
     "Salt Lake": "saltlakecity", "Honolulu": "honolulu"
 }
 
-# OFFERUP TARGETS (Locked-in ZIP codes)
+# OFFERUP TARGETS (ZIPs)
 OU_ZIPS = [
     "94102", "90001", "91911", "94203", "80014", "98198", "33593", "30033",
     "60007", "02108", "55111", "88901", "44101", "97229", "73301", "75001",
@@ -49,9 +49,9 @@ OU_ZIPS = [
 CATEGORIES = {"cars": "cta", "boats": "boo", "free": "zip"}
 
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 Version/17.4 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36",
 ]
 
 # ─── SEEN IDs ───
@@ -81,7 +81,7 @@ def get_mileage(text):
 def get_proxy():
     return random.choice(PROXIES)
 
-# ─── WORKERS ───
+# ─── WORKER ───
 async def check_cl_city(app, label, slug, semaphore):
     async with semaphore:
         now = datetime.utcnow()
@@ -89,21 +89,20 @@ async def check_cl_city(app, label, slug, semaphore):
             url = f"https://{slug}.craigslist.org/search/{cat_code}?format=rss"
             try:
                 headers = {"User-Agent": random.choice(USER_AGENTS)}
+                # Use a fresh client for every city to save RAM
                 async with httpx.AsyncClient(proxy=get_proxy(), timeout=20) as client:
                     resp = await client.get(url, headers=headers)
                     feed = feedparser.parse(resp.text)
                     
-                    for entry in feed.entries[:10]:
+                    for entry in feed.entries[:8]:
                         eid = getattr(entry, "id", entry.link)
                         if eid in seen: continue
                         
-                        # Time Filter (40 mins)
                         pub = entry.get("published_parsed")
                         if pub:
                             dt = datetime.fromtimestamp(time.mktime(pub))
                             if (now - dt) > timedelta(minutes=MAX_AGE_MINUTES): continue
 
-                        # Category Filter: Only 'free' must have the word 'free' in title
                         if cat_name == "free" and "free" not in entry.title.lower():
                             seen.add(eid)
                             mark_seen(eid)
@@ -114,38 +113,32 @@ async def check_cl_city(app, label, slug, semaphore):
                         mileage = get_mileage(desc) if cat_name == "cars" else ""
                         
                         cat_label = "🆓 FREE" if cat_name == "free" else "🚤 BOAT" if cat_name == "boats" else "🚗 CAR"
-                        
-                        msg = f"*{cat_label} | CL {label.upper()}*\n\n"
-                        msg += f"📌 {entry.title}\n"
+                        msg = f"*{cat_label} | CL {label.upper()}*\n\n📌 {entry.title}\n"
                         if price: msg += f"💰 {price}\n"
                         if mileage: msg += f"🛣️ {mileage}\n"
                         
                         kb = InlineKeyboardMarkup([[InlineKeyboardButton("⚡ OPEN PULSE", url=entry.link)]])
-                        
                         await app.bot.send_message(CHAT_ID, msg, parse_mode="Markdown", reply_markup=kb)
                         seen.add(eid)
                         mark_seen(eid)
-            except Exception as e:
-                print(f"Error checking {label}: {e}")
-            
-            # Anti-Block Delay between categories
-            await asyncio.sleep(random.uniform(2, 5))
+            except: continue
+            await asyncio.sleep(random.uniform(2, 4))
 
 # ─── MAIN LOOP ───
 async def scan(app):
-    semaphore = asyncio.Semaphore(3)
+    # LEAN MODE: Semaphore 1 prevents Exit Code 137 (Out of Memory)
+    semaphore = asyncio.Semaphore(1)
     print(f"🚀 Dual-Scout Live: {len(CL_CITIES)} CL Cities | {len(OU_ZIPS)} OU Zips")
     
     while True:
-        # Run Craigslist Sweep (Full 24 Cities)
         cl_items = list(CL_CITIES.items())
         random.shuffle(cl_items)
-        tasks = [check_cl_city(app, label, slug, semaphore) for label, slug in cl_items]
-        await asyncio.gather(*tasks)
+        # Check cities one by one to keep RAM usage extremely low
+        for label, slug in cl_items:
+            await check_cl_city(app, label, slug, semaphore)
         
-        # 15-18 Minute Randomized Pause
         wait = random.randint(900, 1080)
-        print(f"✅ Sweep complete. Pausing for {wait // 60} minutes to prevent blocks...")
+        print(f"✅ Sweep complete. Pausing {wait // 60}m.")
         await asyncio.sleep(wait)
 
 async def post_init(app):
