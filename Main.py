@@ -20,11 +20,8 @@ PROXIES = [f"http://oyexvpgk-us-{i}:tde8ndie2iu8@p.webshare.io:80" for i in rang
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 ]
-
-CATEGORIES = {"cars": "cto", "boats": "boo", "free": "zip"}
 
 CITIES = {
     "San Francisco": "sfbay", "Los Angeles": "losangeles", "San Diego": "sandiego",
@@ -48,12 +45,8 @@ def mark_seen(lid):
 seen = load_seen()
 
 async def fetch_feed(url: str):
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "application/xml,text/xml,*/*",
-        "Referer": "https://www.google.com/"
-    }
-    # FIX: Using 'proxy' singular for newer httpx versions
+    headers = {"User-Agent": random.choice(USER_AGENTS)}
+    # FIX: Changed 'proxies' to 'proxy' for compatibility
     selected_proxy = random.choice(PROXIES)
     
     async with httpx.AsyncClient(proxy=selected_proxy, timeout=30.0, follow_redirects=True) as client:
@@ -73,7 +66,7 @@ async def send_alert(app, title, link, city, price=""):
 async def check_city(app, city_label, city_slug, semaphore):
     async with semaphore:
         now = datetime.utcnow()
-        for cat_name, cat_code in CATEGORIES.items():
+        for cat_code in ["cto", "boo", "zip"]:
             url = f"https://{city_slug}.craigslist.org/search/{cat_code}?format=rss"
             try:
                 entries = await fetch_feed(url)
@@ -94,27 +87,28 @@ async def check_city(app, city_label, city_slug, semaphore):
                     await send_alert(app, title, entry.link, city_label, price)
                     seen.add(eid); mark_seen(eid)
             except Exception: pass
-            await asyncio.sleep(random.uniform(5, 10))
+            await asyncio.sleep(random.uniform(3, 7))
 
 async def scan_loop(app):
     semaphore = asyncio.Semaphore(1) 
-    print("🚀 Stealth Scan Live. Monitoring 24 cities...")
-
+    print("🚀 FIXED: Stealth Scan Live...")
     while True:
         city_items = list(CITIES.items())
         random.shuffle(city_items)
-        
         for label, slug in city_items:
             await check_city(app, label, slug, semaphore)
-            await asyncio.sleep(random.uniform(10, 20))
-
-        wait_time = random.randint(600, 900) 
-        print(f"✅ Full Sweep Done. Sleeping {wait_time // 60}m.")
-        await asyncio.sleep(wait_time)
+        await asyncio.sleep(random.randint(600, 900))
 
 async def post_init(app):
     asyncio.create_task(scan_loop(app))
 
 def main():
     try:
-        app = Application.builder
+        app = Application.builder().token(TOKEN).post_init(post_init).build()
+        # drop_pending_updates=True clears the 'Conflict' error instantly
+        app.run_polling(drop_pending_updates=True)
+    except Exception as e:
+        print(f"FATAL: {e}")
+
+if __name__ == "__main__":
+    main()
