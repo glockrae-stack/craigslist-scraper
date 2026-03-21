@@ -1,65 +1,77 @@
-import asyncio
-import httpx
+import requests
 from bs4 import BeautifulSoup
+import time
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0"
 }
 
+# -----------------------
+# CRAIGSLIST CONFIG
+# -----------------------
 CITIES = {
-    "New York": "newyork",
-    "Los Angeles": "losangeles",
-    "Chicago": "chicago",
-    "Dallas": "dallas",
-    "Miami": "miami",
+    "indianapolis": "https://indianapolis.craigslist.org",
+    "chicago": "https://chicago.craigslist.org"
 }
 
-CATEGORIES = {
-    "cars": "sss",
-    "boats": "boa",
-    "free": "zip"
+CL_SECTIONS = {
+    "cars": "cta",   # cars & trucks
+    "boats": "boa",  # boats
+    "free": "zip"    # free stuff
 }
 
-async def fetch_craigslist(city_name, city_slug, category_name, category_code):
-    url = f"https://{city_slug}.craigslist.org/search/{category_code}?sort=date"
+# -----------------------
+# OFFERUP CONFIG
+# -----------------------
+OFFERUP_URLS = {
+    "cars": "https://offerup.com/explore/k/cars-trucks/",
+    "boats": "https://offerup.com/explore/k/boats/"
+}
 
+seen = set()
+
+# -----------------------
+# CRAIGSLIST SCRAPER
+# -----------------------
+def get_craigslist_links(url):
     try:
-        async with httpx.AsyncClient(headers=HEADERS, timeout=10) as client:
-            res = await client.get(url)
-            res.raise_for_status()
-
+        res = requests.get(url, headers=HEADERS, timeout=10)
         soup = BeautifulSoup(res.text, "html.parser")
-        listings = soup.select(".cl-static-search-result a")
 
         links = []
-        for item in listings[:5]:  # limit spam
-            link = item.get("href")
-            if link and link.startswith("http"):
-                links.append(link)
+        for a in soup.select(".cl-search-result a"):
+            href = a.get("href")
+            if href and href.startswith("http"):
+                links.append(href)
 
-        print(f"\n[{city_name}] {category_name.upper()}")
-        for l in links:
-            print(l)
+        return links[:10]
 
     except Exception as e:
-        print(f"[CL ERROR] {city_name} | {category_name} → {e}")
+        print("CL ERROR:", e)
+        return []
 
+# -----------------------
+# OFFERUP SCRAPER
+# -----------------------
+def get_offerup_links(url):
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=10)
+        soup = BeautifulSoup(res.text, "html.parser")
 
-async def main():
-    while True:
-        tasks = []
+        links = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
 
-        for city_name, city_slug in CITIES.items():
-            for category_name, category_code in CATEGORIES.items():
-                tasks.append(
-                    fetch_craigslist(city_name, city_slug, category_name, category_code)
-                )
+            if "/item/detail/" in href:
+                full_link = "https://offerup.com" + href
+                links.append(full_link)
 
-        await asyncio.gather(*tasks)
+        return list(set(links))[:10]
 
-        print("\n[INFO] Waiting 60s before next cycle...\n")
-        await asyncio.sleep(60)
+    except Exception as e:
+        print("OU ERROR:", e)
+        return []
 
-
-if __name__ == "__main__":
-    asyncio.run(main())
+# -----------------------
+# MAIN LOOP
+# -----------------------
