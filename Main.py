@@ -10,8 +10,8 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application
 
 # ─── CONFIG ───
-# NEW TOKEN APPLIED
-TOKEN = "8761442506:AAGs-ec3RXZ_9O86DIxMCSlEjiN9r0ytLk4" 
+# LATEST TOKEN APPLIED
+TOKEN = "8761442506:AAFO9mZHLhxlEFf0yjW0YArbc0lLmOBQg9Y" 
 CHAT_ID = "6549307194"
 DB_FILE = "seen_ids.txt"
 MAX_AGE_MINUTES = 40 
@@ -57,7 +57,7 @@ async def fetch_feed(url: str):
     proxy = {"all://": random.choice(PROXIES)}
     
     async with httpx.AsyncClient(proxies=proxy, timeout=30.0, follow_redirects=True) as client:
-        await asyncio.sleep(random.uniform(1, 2))
+        await asyncio.sleep(random.uniform(1, 2)) # Human-like pause
         resp = await client.get(url, headers=headers)
         if resp.status_code == 200:
             return feedparser.parse(resp.text).entries
@@ -81,6 +81,7 @@ async def check_city(app, city_label, city_slug, semaphore):
                     eid = getattr(entry, "id", entry.link)
                     if eid in seen: continue
 
+                    # 40-MINUTE FRESHNESS CHECK
                     published = entry.get("published_parsed")
                     if published:
                         dt = datetime.fromtimestamp(time.mktime(published))
@@ -94,19 +95,19 @@ async def check_city(app, city_label, city_slug, semaphore):
                     await send_alert(app, title, entry.link, city_label, price)
                     seen.add(eid); mark_seen(eid)
             except Exception: pass
-            await asyncio.sleep(random.uniform(5, 10))
+            await asyncio.sleep(random.uniform(5, 10)) # Gap between categories
 
 async def scan_loop(app):
-    semaphore = asyncio.Semaphore(1) 
-    print("🚀 Stealth Scan Live with New Token...")
+    semaphore = asyncio.Semaphore(1) # Stealth mode: one city at a time
+    print("🚀 Stealth Scan Live with Token ...Qg9Y")
 
     while True:
         city_items = list(CITIES.items())
-        random.shuffle(city_items)
+        random.shuffle(city_items) # Randomize order to avoid patterns
         
         for label, slug in city_items:
             await check_city(app, label, slug, semaphore)
-            await asyncio.sleep(random.uniform(10, 20))
+            await asyncio.sleep(random.uniform(10, 20)) # Gap between cities
 
         wait_time = random.randint(600, 900) 
         print(f"✅ Full Sweep Done. Sleeping {wait_time // 60}m.")
@@ -118,11 +119,13 @@ async def post_init(app):
 def main():
     try:
         app = Application.builder().token(TOKEN).post_init(post_init).build()
-        print("🤖 Bot instance created successfully.")
+        print("🤖 Bot instance authorized and running.")
         app.run_polling(drop_pending_updates=True)
     except Exception as e:
-        print(f"\n❌ FATAL TOKEN ERROR: {e}")
-        print("Your Telegram token was rejected. Please check it in @BotFather.\n")
+        if "Unauthorized" in str(e):
+            print("\n❌ TOKEN ERROR: The Telegram token was rejected. Re-check @BotFather.")
+        else:
+            print(f"\n❌ STARTUP ERROR: {e}")
 
 if __name__ == "__main__":
     main()
