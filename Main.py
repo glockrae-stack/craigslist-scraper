@@ -1,42 +1,38 @@
 import asyncio
 import os
 import random
-import re
-import time
 from datetime import datetime, timedelta
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application
 import httpx
 import feedparser
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
 
 # ─── CONFIG ───
-# DOUBLE CHECK THIS TOKEN MATCHES BOTFATHER EXACTLY
 TOKEN   = "8761442506:AAFRij1t2Wkm1MWD27Yoys4Gm-q4ZCjpT9M"
 CHAT_ID = "8761442506"
 DB_FILE = "seen_ids.txt"
-MAX_AGE_MINUTES = 40
 
-PROXIES = [
-    "http://oyexvpgk-us-1:tde8ndie2iu8@p.webshare.io:80",
-    "http://oyexvpgk-us-2:tde8ndie2iu8@p.webshare.io:80",
-    "http://oyexvpgk-us-3:tde8ndie2iu8@p.webshare.io:80",
-    "http://oyexvpgk-us-4:tde8ndie2iu8@p.webshare.io:80",
-    "http://oyexvpgk-us-5:tde8ndie2iu8@p.webshare.io:80",
-    "http://oyexvpgk-us-6:tde8ndie2iu8@p.webshare.io:80",
-    "http://oyexvpgk-us-7:tde8ndie2iu8@p.webshare.io:80",
-]
+# ─── HEARTBEAT SERVER (Tricks Railway into staying online) ───
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is alive")
 
+def run_health_server():
+    # Railway provides a PORT variable, usually 8080
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    print(f"📡 Heartbeat server started on port {port}")
+    server.serve_forever()
+
+# ─── SCANNER LOGIC ───
 CL_CITIES = {
     "San Francisco": "sfbay", "Los Angeles": "losangeles", "San Diego": "sandiego",
-    "Sacramento": "sacramento", "Seattle": "seattle", "Tampa Bay": "tampa",
-    "Atlanta": "atlanta", "Chicago": "chicago", "Boston": "boston",
-    "Minneapolis": "minneapolis", "Las Vegas": "lasvegas", "Portland": "portland",
-    "Austin": "austin", "Dallas": "dallas", "Houston": "houston", "Miami": "miami",
-    "Detroit": "detroit", "Phoenix": "phoenix", "Philadelphia": "philadelphia",
-    "Baltimore": "baltimore", "St. Louis": "stlouis", "Nashville": "nashville",
-    "Salt Lake": "saltlakecity", "Honolulu": "honolulu"
+    "Chicago": "chicago", "Miami": "miami", "Phoenix": "phoenix"
 }
-
 CATEGORIES = {"cars": "cta", "boats": "boo", "free": "zip"}
 
 def load_seen():
@@ -49,67 +45,45 @@ def mark_seen(lid):
 
 seen = load_seen()
 
-async def check_cl_city(app, label, slug, semaphore):
-    async with semaphore:
-        now = datetime.utcnow()
-        for cat_name, cat_code in CATEGORIES.items():
-            url = f"https://{slug}.craigslist.org/search/{cat_code}?format=rss"
-            try:
-                async with httpx.AsyncClient(proxy=random.choice(PROXIES), timeout=20) as client:
-                    resp = await client.get(url)
-                    feed = feedparser.parse(resp.text)
-                    for entry in feed.entries[:8]:
-                        eid = getattr(entry, "id", entry.link)
-                        if eid in seen: continue
-                        
-                        pub = entry.get("published_parsed")
-                        if pub:
-                            dt = datetime.fromtimestamp(time.mktime(pub))
-                            if (now - dt) > timedelta(minutes=MAX_AGE_MINUTES): continue
-
-                        cat_label = "🆓 FREE" if cat_name == "free" else "🚤 BOAT" if cat_name == "boats" else "🚗 CAR"
-                        msg = f"*{cat_label} | {label}*\n\n📌 {entry.title}"
-                        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⚡ OPEN PULSE", url=entry.link)]])
-                        
-                        await app.bot.send_message(CHAT_ID, msg, parse_mode="Markdown", reply_markup=kb)
-                        seen.add(eid)
-                        mark_seen(eid)
-            except: continue
-            await asyncio.sleep(random.uniform(2, 4))
-
-async def scan(app):
-    semaphore = asyncio.Semaphore(1)
-    while True:
-        items = list(CL_CITIES.items())
-        random.shuffle(items)
-        for label, slug in items:
-            await check_cl_city(app, label, slug, semaphore)
-        
-        wait = random.randint(900, 1080)
-        print(f"✅ Sweep done. Sleeping {wait//60}m...")
-        await asyncio.sleep(wait)
+async def check_cl_city(app, label, slug):
+    now = datetime.utcnow()
+    for cat_name, cat_code in CATEGORIES.items():
+        url = f"https://{slug}.craigslist.org/search/{cat_code}?format=rss"
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(url)
+                feed = feedparser.parse(resp.text)
+                for entry in feed.entries[:5]:
+                    eid = getattr(entry, "id", entry.link)
+                    if eid in seen: continue
+                    
+                    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⚡ OPEN", url=entry.link)]])
+                    await app.bot.send_message(CHAT_ID, f"*{cat_name.upper()} | {label}*\n{entry.title}", parse_mode="Markdown", reply_markup=kb)
+                    seen.add(eid)
+                    mark_seen(eid)
+        except: continue
 
 async def main():
-    print("⏳ Starting up... Waiting 15s for Railway to settle.")
-    await asyncio.sleep(15)
+    print("⏳ Starting up...")
     
-    # Initialize application
+    # 1. Start the Heartbeat server in the background
+    threading.Thread(target=run_health_server, daemon=True).start()
+    
+    # 2. Start the Telegram Bot
     app = Application.builder().token(TOKEN).build()
-    
     await app.initialize()
     await app.start()
     
-    # Start polling and background scan
-    print("🚀 Taking control of the token...")
-    asyncio.create_task(app.updater.start_polling(drop_pending_updates=True))
-    asyncio.create_task(scan(app))
+    # Drop old messages to avoid a flood of "Conflict" errors
+    await app.updater.start_polling(drop_pending_updates=True)
+    print("🚀 Taking control of the token... Bot is LIVE.")
     
-    # Keep the script alive
     while True:
-        await asyncio.sleep(3600)
+        for label, slug in CL_CITIES.items():
+            await check_cl_city(app, label, slug)
+            await asyncio.sleep(10) # Slow down to avoid proxy blocks
+        print("✅ Round finished. Sleeping 10m.")
+        await asyncio.sleep(600)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    asyncio.run(main())
