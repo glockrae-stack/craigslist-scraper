@@ -1,13 +1,9 @@
 """
 Virtual Broker Bot — main.py
 ─────────────────────────────────────────────
-Best of both:
-- RSS feeds (no HTML scraping, reliable titles)
-- seen_ids.txt dedup (no repeat alerts)
-- Priority scoring (brands, condition, urgency)
-- Wave-based scanning with human-like delays
-- ⚡ OPEN PULSE button on every alert
-- OfferUp deep links per city
+Craigslist:  Wave-based RSS scanning with priority scoring
+OfferUp:     Deep link alerts per city
+Proxy:       WebShare Rotating Residential — real US IPs
 """
 
 import asyncio
@@ -17,6 +13,7 @@ import os
 import random
 import re
 from functools import partial
+import urllib.request
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -27,18 +24,19 @@ TOKEN   = "8761442506:AAFPCQyaKuSbjuc4s8SwzKYvMAFHQ5QlgXY"
 CHAT_ID = "6549307194"
 DB_FILE = "seen_ids.txt"
 
-# Wave timing (seconds)
-WAVE_MIN       = 240   # 4 min per wave
-WAVE_MAX       = 420   # 7 min per wave
-BREAK_MIN      = 60    # break between categories
+# WebShare Rotating Residential Proxy
+PROXY_URL = "http://oyexvpgk-AD-AE-AF-AG-AI-AL-A:tde8ndie2iu8@p.webshare.io:80"
+
+# Wave timing
+BREAK_MIN      = 60
 BREAK_MAX      = 180
-LONG_BREAK_MIN = 360   # long break after full cycle
+LONG_BREAK_MIN = 360
 LONG_BREAK_MAX = 720
-REQ_DELAY_MIN  = 8     # human-like delay between requests
+REQ_DELAY_MIN  = 8
 REQ_DELAY_MAX  = 22
 
 # ─────────────────────────────────────────────
-# HEADERS
+# USER AGENTS
 # ─────────────────────────────────────────────
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
@@ -113,7 +111,7 @@ def ou_link(slug: str, query: str) -> str:
     return f"https://offerup.com/search/?q={query}&location={slug}&delivery_param=p&sort=-p"
 
 # ─────────────────────────────────────────────
-# PRIORITY SCORING (from ChatGPT bot)
+# PRIORITY SCORING
 # ─────────────────────────────────────────────
 HIGH_VALUE_KEYWORDS = ["must go", "asap", "first come", "moving", "today only", "free today"]
 GOOD_CONDITION      = ["like new", "excellent", "clean", "barely used", "mint", "perfect"]
@@ -214,28 +212,35 @@ async def send_alert(app, title: str, link: str, city: str, price: str = "", mil
     log.info("%s[%s] %s", "🔥 " if priority else "✅ ", city, title[:60])
 
 # ─────────────────────────────────────────────
-# CRAIGSLIST WAVE
-# Scans a random subset of cities each wave
-# Collects high priority first, sends normal after
+# CRAIGSLIST FETCH — through rotating proxy
 # ─────────────────────────────────────────────
 def _fetch_feed(url: str, headers: dict):
-    return feedparser.parse(url, request_headers=headers)
+    proxy_handler = urllib.request.ProxyHandler({
+        "http":  PROXY_URL,
+        "https": PROXY_URL,
+    })
+    opener = urllib.request.build_opener(proxy_handler)
+    opener.addheaders = list(headers.items())
+    try:
+        response = opener.open(url, timeout=15)
+        content  = response.read()
+        return feedparser.parse(content)
+    except Exception as e:
+        raise e
 
+# ─────────────────────────────────────────────
+# CRAIGSLIST WAVE
+# ─────────────────────────────────────────────
 async def craigslist_wave(app, feed_type: str):
     loop       = asyncio.get_event_loop()
     city_items = list(CL_CITIES.items())
     random.shuffle(city_items)
-    # Pick random subset of cities per wave (like ChatGPT bot)
     wave_cities = city_items[:random.randint(8, len(city_items))]
 
     high_priority = []
     normal        = []
 
-    category_map = {
-        "cars":  "cto",
-        "boats": "boo",
-        "free":  "zip",
-    }
+    category_map = {"cars": "cto", "boats": "boo", "free": "zip"}
     cl_cat = category_map[feed_type]
 
     for city_label, cl_slug in wave_cities:
@@ -262,32 +267,25 @@ async def craigslist_wave(app, feed_type: str):
                 score   = score_listing(title)
 
                 item = (title, entry.link, city_label, price, mileage, score)
+                seen_ids.add(entry_id)
+                mark_seen(entry_id)
 
                 if score >= 5:
-                    # Fire immediately — top priority
                     await send_alert(app, title, entry.link, city_label, price, mileage, priority=True)
-                    seen_ids.add(entry_id)
-                    mark_seen(entry_id)
                 elif score >= 2:
                     high_priority.append(item)
-                    seen_ids.add(entry_id)
-                    mark_seen(entry_id)
                 else:
                     normal.append(item)
-                    seen_ids.add(entry_id)
-                    mark_seen(entry_id)
 
         except Exception as e:
             log.error("CL ERROR [%s | %s]: %s", city_label, feed_type, e)
             continue
 
-        # Human-like delay between cities
         delay = random.randint(REQ_DELAY_MIN, REQ_DELAY_MAX)
         if random.random() < 0.1:
             delay += random.randint(20, 40)
         await asyncio.sleep(delay)
 
-    # Send high priority batch first, then normal
     for title, link, city, price, mileage, _ in high_priority:
         await send_alert(app, title, link, city, price, mileage, priority=True)
         await asyncio.sleep(1)
@@ -308,7 +306,6 @@ async def offerup_loop(app):
                 alert_id = f"ou_{slug}_{cat_query}"
                 if alert_id in seen_ids:
                     continue
-
                 link = ou_link(slug, cat_query)
                 await send_alert(app, f"{cat_title} — {city_label}", link, city_label)
                 seen_ids.add(alert_id)
@@ -323,7 +320,6 @@ async def offerup_loop(app):
 
 # ─────────────────────────────────────────────
 # MAIN CRAIGSLIST LOOP
-# Wave-based: rotates categories with breaks
 # ─────────────────────────────────────────────
 async def craigslist_loop(app):
     log.info("✅ Craigslist wave loop started")
@@ -335,13 +331,10 @@ async def craigslist_loop(app):
         for cat in categories:
             log.info("🌊 Starting wave: %s", cat)
             await craigslist_wave(app, cat)
-
-            # Break between categories
             break_time = random.randint(BREAK_MIN, BREAK_MAX)
-            log.info("😴 Break between categories: %ds", break_time)
+            log.info("😴 Break: %ds", break_time)
             await asyncio.sleep(break_time)
 
-        # Long break after full cycle
         long_break = random.randint(LONG_BREAK_MIN, LONG_BREAK_MAX)
         if random.random() < 0.2:
             long_break += random.randint(300, 600)
@@ -354,9 +347,10 @@ async def craigslist_loop(app):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⚡ *Virtual Broker Bot is live.*\n\n"
-        f"🚗 Craigslist: {len(CL_CITIES)} cities | Wave-based scanning\n"
+        f"🚗 Craigslist: {len(CL_CITIES)} cities | Wave scanning\n"
         f"📲 OfferUp: {len(OU_CITIES)} cities | Deep links\n"
-        f"🔥 Priority scoring on every listing\n\n"
+        f"🔥 Priority scoring active\n"
+        f"🔒 Rotating residential proxy\n\n"
         "Commands:\n/start — this message\n/status — stats",
         parse_mode="Markdown"
     )
@@ -389,4 +383,4 @@ def main():
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    main() in 
+    main()
