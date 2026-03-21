@@ -1,91 +1,95 @@
-# ─────────────────────────────────────────────
-# OFFERUP LOOP — FRESH LISTINGS ONLY
-# ─────────────────────────────────────────────
+import asyncio
+import httpx
 import datetime
-import json
+import random
+from typing import List
 
-async def fetch_ou_feed(client: httpx.AsyncClient, slug: str, category: str) -> list:
+# ---------------------------
+# CONFIG
+# ---------------------------
+CL_CITIES = ["Las Vegas", "Austin", "Albuquerque", "SF Bay", "Chicago",
+             "Phoenix", "Miami", "Los Angeles", "San Diego", "Washington DC",
+             "Atlanta", "New York", "Portland", "Dallas", "Boston", "Detroit", "Minneapolis", "Colorado Springs"]
+
+OU_CATEGORIES = ["cars", "boats", "free_stuff"]  # example categories
+
+# store seen URLs to avoid reposting
+seen_cl_items = set()
+seen_ou_items = set()
+
+# ---------------------------
+# HELPERS
+# ---------------------------
+async def fetch_cl_feed(client: httpx.AsyncClient, city: str, category: str) -> List[dict]:
     """
-    Fetches OfferUp listings for a city and category.
-    Returns a list of dicts: {'title', 'link', 'price', 'timestamp'}
+    Fetch recent Craigslist items for a city/category
+    Only keep items posted in the last 40 minutes
     """
-    url = f"https://offerup.com/api/1/items/?location={slug}&q={category}&delivery_param=p&sort=-p"
+    url = f"https://{city.lower().replace(' ', '')}.craigslist.org/search/{category}?sort=date"
     try:
-        resp = await client.get(url, timeout=15)
-        if resp.status_code != 200:
-            return []
-
-        data = resp.json()
+        resp = await client.get(url, timeout=10)
+        resp.raise_for_status()
+        html = resp.text
+        # Parse HTML: simple regex to extract links and timestamps
+        # (replace with BeautifulSoup for more reliability)
         items = []
-
-        for item in data.get("items", []):
-            title = item.get("title", "").strip()
-            if not title:
-                continue
-
-            # Only get actual listing links
-            link = f"https://offerup.com/item/{item.get('id')}/"
-            price = f"${item.get('price', 0)}" if item.get('price') else ""
-            
-            # convert timestamp to datetime
-            ts = item.get("created_at")  # unix timestamp
-            if ts:
-                timestamp = datetime.datetime.utcfromtimestamp(ts)
-            else:
-                timestamp = datetime.datetime.utcnow()  # fallback
-
-            items.append({
-                "title": title,
-                "link": link,
-                "price": price,
-                "timestamp": timestamp
-            })
-
+        import re
+        for match in re.finditer(r'<a href="(https://[^"]+)".*?class="result-date" datetime="([^"]+)"', html):
+            link, dt_str = match.groups()
+            dt_posted = datetime.datetime.fromisoformat(dt_str)
+            delta = datetime.datetime.now() - dt_posted
+            if delta.total_seconds() <= 40 * 60 and link not in seen_cl_items:
+                items.append({"link": link, "posted": dt_posted})
+                seen_cl_items.add(link)
         return items
-
     except Exception as e:
-        log.warning("OfferUp fetch failed [%s | %s]: %s", slug, category, e)
+        print(f"[CL ERROR] {city} | {category} → {e}")
         return []
 
-# ─────────────────────────────────────────────
-# OFFERUP WAVE LOOP
-# ─────────────────────────────────────────────
-async def offerup_wave(app):
-    MAX_AGE = datetime.timedelta(minutes=40)
+async def fetch_ou_feed(client: httpx.AsyncClient, slug: str, category: str) -> List[dict]:
+    """
+    Fetch OfferUp feed for a category/slug
+    Only keep new items
+    """
+    url = f"https://offerup.com/api/feed/{slug}/{category}"
+    try:
+        resp = await client.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        items = []
+        for item in data.get("items", []):
+            link = item.get("url")
+            posted = datetime.datetime.fromisoformat(item.get("posted_at"))
+            if link not in seen_ou_items:
+                items.append({"link": link, "posted": posted})
+                seen_ou_items.add(link)
+        return items
+    except Exception as e:
+        print(f"[OU ERROR] {slug} | {category} → {e}")
+        return []
+
+async def process_cl():
     async with httpx.AsyncClient() as client:
-        while True:
-            for city_label, slug in OU_CITIES.items():
-                for cat_query, cat_title in OU_CATEGORIES.items():
-                    items = await fetch_ou_feed(client, slug, cat_query)
+        for city in CL_CITIES:
+            for category in ["cars", "boats", "free_stuff"]:
+                items = await fetch_cl_feed(client, city, category)
+                for item in items:
+                    print(f"✅ [CL] {city} | {category} → {item['link']}")
+            await asyncio.sleep(random.uniform(1, 2))  # avoid hammering servers
 
-                    for item in items:
-                        # skip old listings
-                        if datetime.datetime.utcnow() - item["timestamp"] > MAX_AGE:
-                            continue
+async def process_ou():
+    async with httpx.AsyncClient() as client:
+        for category in OU_CATEGORIES:
+            items = await fetch_ou_feed(client, "slug_placeholder", category)
+            for item in items:
+                print(f"✅ [OU] {category} → {item['link']}")
+            await asyncio.sleep(random.uniform(1, 2))  # rate-limit
 
-                        # dedupe
-                        title_key = re.sub(r'[^a-z0-9]', '', item["title"].lower())
-                        alert_id = f"ou_{slug}_{cat_query}_{title_key}"
-                        if alert_id in seen_ids:
-                            continue
-                        seen_ids.add(alert_id)
-                        mark_seen(alert_id)
+async def main_loop():
+    while True:
+        await asyncio.gather(process_cl(), process_ou())
+        print(f"[INFO] Waiting 60s before next cycle...")
+        await asyncio.sleep(60)  # cycle every minute
 
-                        # send alert
-                        await send_alert(
-                            app,
-                            f"{cat_title} — {city_label}: {item['title']}",
-                            item['link'],
-                            city_label,
-                            item['price'],
-                            priority=True  # everything recent is priority
-                        )
-                        await asyncio.sleep(random.uniform(2, 4))
-
-            # After full cycle, clean old OU keys to allow reposts
-            ou_keys = [k for k in seen_ids if k.startswith("ou_")]
-            for k in ou_keys:
-                # keep only the last 40 mins
-                pass  # optional: implement expiration if needed
-            log.info("📲 OU cycle done. Sleeping 300s...")
-            await asyncio.sleep(300)
+if __name__ == "__main__":
+    asyncio.run(main_loop())
