@@ -32,8 +32,8 @@ BREAK_MIN      = 60
 BREAK_MAX      = 180
 LONG_BREAK_MIN = 360
 LONG_BREAK_MAX = 720
-REQ_DELAY_MIN  = 8
-REQ_DELAY_MAX  = 22
+REQ_DELAY_MIN  = 15
+REQ_DELAY_MAX  = 35
 
 # ─────────────────────────────────────────────
 # CITIES
