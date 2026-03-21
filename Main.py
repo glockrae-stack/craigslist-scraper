@@ -1,84 +1,65 @@
 import asyncio
 import httpx
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
 
-SEEN = set()
+HEADERS = {
+    "User-Agent": "Mozilla/5.0"
+}
 
 CITIES = {
-    "indianapolis": "https://indianapolis.craigslist.org",
-    "chicago": "https://chicago.craigslist.org",
+    "New York": "newyork",
+    "Los Angeles": "losangeles",
+    "Chicago": "chicago",
+    "Dallas": "dallas",
+    "Miami": "miami",
 }
 
 CATEGORIES = {
-    "cars": "cta",        # cars & trucks
-    "free": "zip",        # free stuff
-    "boats": "boa"        # boats
+    "cars": "sss",
+    "boats": "boa",
+    "free": "zip"
 }
 
-MAX_AGE_MINUTES = 40
-
-
-# ---------------------------
-# TIME FILTER
-# ---------------------------
-def is_recent(post_time_str):
-    try:
-        post_time = datetime.fromisoformat(post_time_str)
-        return datetime.utcnow() - post_time <= timedelta(minutes=MAX_AGE_MINUTES)
-    except:
-        return False
-
-
-# ---------------------------
-# CRAIGSLIST SCRAPER
-# ---------------------------
-async def fetch_craigslist(client, base_url, category_code):
-    url = f"{base_url}/search/{category_code}?sort=date"
+async def fetch_craigslist(city_name, city_slug, category_name, category_code):
+    url = f"https://{city_slug}.craigslist.org/search/{category_code}?sort=date"
 
     try:
-        r = await client.get(url, timeout=10)
-        soup = BeautifulSoup(r.text, "html.parser")
+        async with httpx.AsyncClient(headers=HEADERS, timeout=10) as client:
+            res = await client.get(url)
+            res.raise_for_status()
+
+        soup = BeautifulSoup(res.text, "html.parser")
+        listings = soup.select(".cl-static-search-result a")
 
         links = []
+        for item in listings[:5]:  # limit spam
+            link = item.get("href")
+            if link and link.startswith("http"):
+                links.append(link)
 
-        for row in soup.select(".cl-search-result"):
-            link_tag = row.select_one("a")
-            time_tag = row.select_one("time")
-
-            if not link_tag or not time_tag:
-                continue
-
-            link = link_tag.get("href")
-            post_time = time_tag.get("datetime")
-
-            if link and post_time and is_recent(post_time):
-                if link not in SEEN:
-                    SEEN.add(link)
-                    links.append(link)
-
-        return links
+        print(f"\n[{city_name}] {category_name.upper()}")
+        for l in links:
+            print(l)
 
     except Exception as e:
-        print(f"[CL ERROR] {url} → {e}")
-        return []
+        print(f"[CL ERROR] {city_name} | {category_name} → {e}")
 
 
-# ---------------------------
-# OFFERUP SCRAPER (NO API)
-# ---------------------------
-async def fetch_offerup(client, query):
-    url = f"https://offerup.com/search/?q={query}"
+async def main():
+    while True:
+        tasks = []
 
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
+        for city_name, city_slug in CITIES.items():
+            for category_name, category_code in CATEGORIES.items():
+                tasks.append(
+                    fetch_craigslist(city_name, city_slug, category_name, category_code)
+                )
 
-    try:
-        r = await client.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(r.text, "html.parser")
+        await asyncio.gather(*tasks)
 
-        links = []
+        print("\n[INFO] Waiting 60s before next cycle...\n")
+        await asyncio.sleep(60)
 
-        for a in soup.select("a[href*='/item/detail/']"):
-            link = "https://offer
+
+if __name__ == "__main__":
+    asyncio.run(main())
