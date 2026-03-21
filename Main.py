@@ -15,13 +15,8 @@ CHAT_ID = "6549307194"
 DB_FILE = "seen_ids.txt"
 MAX_AGE_MINUTES = 40 
 
-# WebShare Proxies
 PROXIES = [f"http://oyexvpgk-us-{i}:tde8ndie2iu8@p.webshare.io:80" for i in range(1, 8)]
-
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-]
+USER_AGENTS = ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"]
 
 CITIES = {
     "San Francisco": "sfbay", "Los Angeles": "losangeles", "San Diego": "sandiego",
@@ -44,22 +39,24 @@ def mark_seen(lid):
 
 seen = load_seen()
 
+async def force_clear_session():
+    """Manually tell Telegram to drop all existing connections for this token."""
+    print("🔄 Attempting to force-clear existing sessions...")
+    url = f"https://api.telegram.org/bot{TOKEN}/getUpdates?offset=-1"
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            await client.get(url)
+            await asyncio.sleep(2)  # Give Telegram time to process the drop
+            print("✅ Session cleared.")
+        except Exception as e:
+            print(f"⚠️ Manual clear failed: {e}")
+
 async def fetch_feed(url: str):
     headers = {"User-Agent": random.choice(USER_AGENTS)}
     selected_proxy = random.choice(PROXIES)
     async with httpx.AsyncClient(proxy=selected_proxy, timeout=30.0, follow_redirects=True) as client:
-        await asyncio.sleep(random.uniform(1, 2))
         resp = await client.get(url, headers=headers)
-        if resp.status_code == 200:
-            return feedparser.parse(resp.text).entries
-        return []
-
-async def send_alert(app, title, link, city, price=""):
-    msg = f"*{title.upper()}*\n💰 {price} • 🏙️ {city}"
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⚡ OPEN PULSE", url=link)]])
-    try:
-        await app.bot.send_message(CHAT_ID, msg, parse_mode="Markdown", reply_markup=kb, disable_web_page_preview=True)
-    except Exception: pass
+        return feedparser.parse(resp.text).entries if resp.status_code == 200 else []
 
 async def check_city(app, city_label, city_slug, semaphore):
     async with semaphore:
@@ -75,17 +72,19 @@ async def check_city(app, city_label, city_slug, semaphore):
                     if published:
                         dt = datetime.fromtimestamp(time.mktime(published))
                         if (now - dt) > timedelta(minutes=MAX_AGE_MINUTES): continue
-                    title = entry.title.strip()
-                    price_match = re.search(r'\$[\d,]+', title)
-                    price = price_match.group(0) if price_match else "N/A"
-                    await send_alert(app, title, entry.link, city_label, price)
+                    
+                    price = (re.search(r'\$[\d,]+', entry.title) or re.search(r'\$[\d,]+', entry.summary or ""))
+                    price_str = price.group(0) if price else "N/A"
+                    
+                    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⚡ OPEN PULSE", url=entry.link)]])
+                    await app.bot.send_message(CHAT_ID, f"*{entry.title.upper()}*\n💰 {price_str} • 🏙️ {city_label}", parse_mode="Markdown", reply_markup=kb, disable_web_page_preview=True)
                     seen.add(eid); mark_seen(eid)
             except Exception: pass
             await asyncio.sleep(random.uniform(2, 4))
 
 async def scan_loop(app):
     semaphore = asyncio.Semaphore(1) 
-    print("🚀 FIXED: Stealth Scan Live...")
+    print("🚀 Stealth Scan Live...")
     while True:
         city_items = list(CITIES.items())
         random.shuffle(city_items)
@@ -94,18 +93,27 @@ async def scan_loop(app):
         await asyncio.sleep(random.randint(300, 600))
 
 async def post_init(app):
-    # This forcefully drops any existing connections
-    await app.bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(scan_loop(app))
 
-def main():
-    try:
-        app = Application.builder().token(TOKEN).post_init(post_init).build()
-        print("🤖 Bot starting...")
-        # Added drop_pending_updates here as a secondary safeguard
-        app.run_polling(drop_pending_updates=True, close_loop=False)
-    except Exception as e:
-        print(f"FATAL: {e}")
+async def run_bot():
+    # 1. Force clear the session before building the app
+    await force_clear_session()
+    
+    # 2. Build and start
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    await app.initialize()
+    await app.start()
+    print("🤖 Bot Authorized. Monitoring...")
+    await app.updater.start_polling(drop_pending_updates=True)
+    
+    # Keep the loop running
+    while True:
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        print(f"FATAL: {e}")
