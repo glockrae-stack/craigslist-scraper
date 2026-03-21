@@ -46,9 +46,9 @@ seen = load_seen()
 
 async def fetch_feed(url: str):
     headers = {"User-Agent": random.choice(USER_AGENTS)}
-    # FIX: Changed 'proxies' to 'proxy' for compatibility
     selected_proxy = random.choice(PROXIES)
     
+    # Using 'proxy' (singular) for httpx compatibility
     async with httpx.AsyncClient(proxy=selected_proxy, timeout=30.0, follow_redirects=True) as client:
         await asyncio.sleep(random.uniform(1, 2))
         resp = await client.get(url, headers=headers)
@@ -85,7 +85,8 @@ async def check_city(app, city_label, city_slug, semaphore):
                     price = price_match.group(0) if price_match else "N/A"
 
                     await send_alert(app, title, entry.link, city_label, price)
-                    seen.add(eid); mark_seen(eid)
+                    seen.add(eid)
+                    mark_seen(eid)
             except Exception: pass
             await asyncio.sleep(random.uniform(3, 7))
 
@@ -97,18 +98,22 @@ async def scan_loop(app):
         random.shuffle(city_items)
         for label, slug in city_items:
             await check_city(app, label, slug, semaphore)
-        await asyncio.sleep(random.randint(600, 900))
+        
+        wait_time = random.randint(600, 900)
+        print(f"Sweep finished. Resting {wait_time // 60} mins.")
+        await asyncio.sleep(wait_time)
 
 async def post_init(app):
     asyncio.create_task(scan_loop(app))
 
 def main():
     try:
+        # Building the application correctly
         app = Application.builder().token(TOKEN).post_init(post_init).build()
-        # drop_pending_updates=True clears the 'Conflict' error instantly
+        print("🤖 Bot instance authorized. Starting polling...")
         app.run_polling(drop_pending_updates=True)
     except Exception as e:
-        print(f"FATAL: {e}")
+        print(f"FATAL ERROR: {e}")
 
 if __name__ == "__main__":
     main()
