@@ -10,6 +10,7 @@ import httpx
 import feedparser
 
 # ─── CONFIG ───
+# DOUBLE CHECK THIS TOKEN MATCHES BOTFATHER EXACTLY
 TOKEN   = "8761442506:AAFRij1t2Wkm1MWD27Yoys4Gm-q4ZCjpT9M"
 CHAT_ID = "8761442506"
 DB_FILE = "seen_ids.txt"
@@ -38,7 +39,6 @@ CL_CITIES = {
 
 CATEGORIES = {"cars": "cta", "boats": "boo", "free": "zip"}
 
-# ─── DB HELPERS ───
 def load_seen():
     if os.path.exists(DB_FILE):
         with open(DB_FILE) as f: return set(f.read().splitlines())
@@ -49,7 +49,6 @@ def mark_seen(lid):
 
 seen = load_seen()
 
-# ─── SCANNER ───
 async def check_cl_city(app, label, slug, semaphore):
     async with semaphore:
         now = datetime.utcnow()
@@ -87,27 +86,30 @@ async def scan(app):
             await check_cl_city(app, label, slug, semaphore)
         
         wait = random.randint(900, 1080)
-        print(f"✅ Sweep complete. Sleeping {wait//60}m...")
+        print(f"✅ Sweep done. Sleeping {wait//60}m...")
         await asyncio.sleep(wait)
 
-# ─── MAIN ───
 async def main():
-    print("⏳ Starting up...")
-    # Give Railway a moment to settle
-    await asyncio.sleep(10)
+    print("⏳ Starting up... Waiting 15s for Railway to settle.")
+    await asyncio.sleep(15)
     
+    # Initialize application
     app = Application.builder().token(TOKEN).build()
     
-    # FORCED CONNECTION: Clears out any old bot instances
     await app.initialize()
-    print("🚀 Taking control of the token...")
-    await app.updater.start_polling(drop_pending_updates=True)
     await app.start()
     
+    # Start polling and background scan
+    print("🚀 Taking control of the token...")
+    asyncio.create_task(app.updater.start_polling(drop_pending_updates=True))
     asyncio.create_task(scan(app))
     
+    # Keep the script alive
     while True:
         await asyncio.sleep(3600)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
