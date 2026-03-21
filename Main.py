@@ -1,19 +1,19 @@
 """
 Virtual Broker Bot — main.py
 ─────────────────────────────────────────────
-Craigslist:  Wave-based RSS scanning with priority scoring
+Craigslist:  Routes through rss2json.com (free RSS proxy)
+             Craigslist sees rss2json's IP, not Railway's
+             No proxy cost, no blocks
 OfferUp:     Deep link alerts per city
-Proxy:       WebShare Rotating Residential — real US IPs
+Priority:    Scoring on every listing
 """
 
 import asyncio
-import feedparser
+import httpx
 import logging
 import os
 import random
 import re
-from functools import partial
-import urllib.request
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -24,8 +24,8 @@ TOKEN   = "8761442506:AAGs-ec3RXZ_9O86DIxMCSlEjiN9r0ytLk4"
 CHAT_ID = "6549307194"
 DB_FILE = "seen_ids.txt"
 
-# WebShare Rotating Residential Proxy
-PROXY_URL = "http://oyexvpgk-AD-AE-AF-AG-AI-AL-AM-AO-AR-AT-AU-AW-AX-AZ-BA-BB-BD-BE-BF-BG-BH-BI-BJ-BM-BN-BO-BQ-BR-BS-BT-BW-BY-BZ-CA-CD-CG-CH-CI-CL-CM-CN-CO-CR-CU-CV-CW-CY-CZ-DJ-DK-DM-DO-DZ-EC-EE-EG-ER-ET-FI-FJ-FM-FO-GA-GB-GD-GE-GF-GG-GH-GI-GL-GM-GN-GP-GQ-GR-GT-GU-GW-GY-HK-HN-HR-HT-HU-ID-IE-IL-IM-IN-IQ-IR-IS-JE-JM-JO-JP-KE-KG-KH-KM-KN-KR-KW-KY-KZ-LA-LB-LC-LI-LK-LR-LS-LT-LU-LV-LY-MA-MC-MD-ME-MF-MG-MH-MK-ML-MM-MN-MO-MP-MQ-MR-MS-MT-MU-MV-MW-MX-MY-MZ-NA-NC-NE-NG-NI-NL-NO-NP-NZ-OM-PA-PE-PF-PG-PH-PK-PL-PR-PS-PT-PW-PY-QA-RE-RO-RS-RU-RW-SA-SB-SC-SD-SE-SG-SH-SI-SK-SL-SM-SN-SO-SR-SS-ST-SV-SX-SY-SZ-TC-TG-TH-TJ-TL-TN-TO-TR-TT-TW-TZ-UA-UG-US-UY-UZ-VC-VE-VG-VI-VN-VU-WS-YE-YT-ZA-ZM-ZW-rotate:tde8ndie2iu8@p.webshare.io:80"
+# rss2json free API — proxies RSS feeds, CL sees their IP not ours
+RSS2JSON = "https://api.rss2json.com/v1/api.json"
 
 # Wave timing
 BREAK_MIN      = 60
@@ -34,23 +34,6 @@ LONG_BREAK_MIN = 360
 LONG_BREAK_MAX = 720
 REQ_DELAY_MIN  = 8
 REQ_DELAY_MAX  = 22
-
-# ─────────────────────────────────────────────
-# USER AGENTS
-# ─────────────────────────────────────────────
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 Safari/604.1",
-    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 Chrome/112.0.0.0 Mobile Safari/537.36",
-]
-
-def get_headers():
-    return {
-        "User-Agent":      random.choice(USER_AGENTS),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer":         "https://www.google.com/",
-    }
 
 # ─────────────────────────────────────────────
 # CITIES
@@ -212,27 +195,32 @@ async def send_alert(app, title: str, link: str, city: str, price: str = "", mil
     log.info("%s[%s] %s", "🔥 " if priority else "✅ ", city, title[:60])
 
 # ─────────────────────────────────────────────
-# CRAIGSLIST FETCH — through rotating proxy
+# CRAIGSLIST FETCH via rss2json (free proxy)
 # ─────────────────────────────────────────────
-def _fetch_feed(url: str, headers: dict):
-    proxy_handler = urllib.request.ProxyHandler({
-        "http":  PROXY_URL,
-        "https": PROXY_URL,
-    })
-    opener = urllib.request.build_opener(proxy_handler)
-    opener.addheaders = list(headers.items())
+async def fetch_cl_feed(client: httpx.AsyncClient, rss_url: str) -> list:
+    """
+    Fetches Craigslist RSS via rss2json.com
+    CL sees rss2json's IP — not Railway's blocked IP
+    Returns list of {title, link, guid, description} dicts
+    """
     try:
-        response = opener.open(url, timeout=15)
-        content  = response.read()
-        return feedparser.parse(content)
+        resp = await client.get(
+            RSS2JSON,
+            params={"rss_url": rss_url, "api_key": "", "count": 50},
+            timeout=20
+        )
+        data = resp.json()
+        if data.get("status") != "ok":
+            log.warning("rss2json bad status: %s", data.get("status"))
+            return []
+        return data.get("items", [])
     except Exception as e:
         raise e
 
 # ─────────────────────────────────────────────
 # CRAIGSLIST WAVE
 # ─────────────────────────────────────────────
-async def craigslist_wave(app, feed_type: str):
-    loop       = asyncio.get_event_loop()
+async def craigslist_wave(app, feed_type: str, client: httpx.AsyncClient):
     city_items = list(CL_CITIES.items())
     random.shuffle(city_items)
     wave_cities = city_items[:random.randint(8, len(city_items))]
@@ -244,38 +232,40 @@ async def craigslist_wave(app, feed_type: str):
     cl_cat = category_map[feed_type]
 
     for city_label, cl_slug in wave_cities:
-        url = f"https://{cl_slug}.craigslist.org/search/{cl_cat}?format=rss"
+        rss_url = f"https://{cl_slug}.craigslist.org/search/{cl_cat}?format=rss"
         try:
-            feed = await loop.run_in_executor(None, partial(_fetch_feed, url, get_headers()))
-            log.info("CL [%s | %s] → %d entries", city_label, feed_type, len(feed.entries))
+            items = await fetch_cl_feed(client, rss_url)
+            log.info("CL [%s | %s] → %d items", city_label, feed_type, len(items))
 
-            for entry in feed.entries:
-                entry_id = getattr(entry, "id", entry.link)
+            for item in items:
+                entry_id = item.get("guid") or item.get("link", "")
                 if entry_id in seen_ids:
                     continue
 
-                title = entry.title.strip()
+                title = item.get("title", "").strip()
+                if not title:
+                    continue
 
                 if feed_type == "free" and "free" not in title.lower():
                     seen_ids.add(entry_id)
                     mark_seen(entry_id)
                     continue
 
+                link    = item.get("link", "")
                 price   = extract_price(title)
-                desc    = getattr(entry, "summary", "") or ""
+                desc    = item.get("description", "") or ""
                 mileage = extract_mileage(desc) if feed_type == "cars" else ""
                 score   = score_listing(title)
 
-                item = (title, entry.link, city_label, price, mileage, score)
                 seen_ids.add(entry_id)
                 mark_seen(entry_id)
 
                 if score >= 5:
-                    await send_alert(app, title, entry.link, city_label, price, mileage, priority=True)
+                    await send_alert(app, title, link, city_label, price, mileage, priority=True)
                 elif score >= 2:
-                    high_priority.append(item)
+                    high_priority.append((title, link, city_label, price, mileage))
                 else:
-                    normal.append(item)
+                    normal.append((title, link, city_label, price, mileage))
 
         except Exception as e:
             log.error("CL ERROR [%s | %s]: %s", city_label, feed_type, e)
@@ -286,13 +276,37 @@ async def craigslist_wave(app, feed_type: str):
             delay += random.randint(20, 40)
         await asyncio.sleep(delay)
 
-    for title, link, city, price, mileage, _ in high_priority:
+    for title, link, city, price, mileage in high_priority:
         await send_alert(app, title, link, city, price, mileage, priority=True)
         await asyncio.sleep(1)
 
-    for title, link, city, price, mileage, _ in normal:
+    for title, link, city, price, mileage in normal:
         await send_alert(app, title, link, city, price, mileage)
         await asyncio.sleep(0.5)
+
+# ─────────────────────────────────────────────
+# MAIN CRAIGSLIST LOOP
+# ─────────────────────────────────────────────
+async def craigslist_loop(app):
+    log.info("✅ Craigslist loop started via rss2json proxy")
+
+    async with httpx.AsyncClient() as client:
+        while True:
+            categories = ["cars", "boats", "free"]
+            random.shuffle(categories)
+
+            for cat in categories:
+                log.info("🌊 Wave: %s", cat)
+                await craigslist_wave(app, cat, client)
+                break_time = random.randint(BREAK_MIN, BREAK_MAX)
+                log.info("😴 Break: %ds", break_time)
+                await asyncio.sleep(break_time)
+
+            long_break = random.randint(LONG_BREAK_MIN, LONG_BREAK_MAX)
+            if random.random() < 0.2:
+                long_break += random.randint(300, 600)
+            log.info("💤 Long break: %ds", long_break)
+            await asyncio.sleep(long_break)
 
 # ─────────────────────────────────────────────
 # OFFERUP LOOP
@@ -319,38 +333,14 @@ async def offerup_loop(app):
         await asyncio.sleep(300)
 
 # ─────────────────────────────────────────────
-# MAIN CRAIGSLIST LOOP
-# ─────────────────────────────────────────────
-async def craigslist_loop(app):
-    log.info("✅ Craigslist wave loop started")
-
-    while True:
-        categories = ["cars", "boats", "free"]
-        random.shuffle(categories)
-
-        for cat in categories:
-            log.info("🌊 Starting wave: %s", cat)
-            await craigslist_wave(app, cat)
-            break_time = random.randint(BREAK_MIN, BREAK_MAX)
-            log.info("😴 Break: %ds", break_time)
-            await asyncio.sleep(break_time)
-
-        long_break = random.randint(LONG_BREAK_MIN, LONG_BREAK_MAX)
-        if random.random() < 0.2:
-            long_break += random.randint(300, 600)
-        log.info("💤 Long break: %ds", long_break)
-        await asyncio.sleep(long_break)
-
-# ─────────────────────────────────────────────
 # COMMANDS
 # ─────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⚡ *Virtual Broker Bot is live.*\n\n"
-        f"🚗 Craigslist: {len(CL_CITIES)} cities | Wave scanning\n"
+        f"🚗 Craigslist: {len(CL_CITIES)} cities | Free RSS proxy\n"
         f"📲 OfferUp: {len(OU_CITIES)} cities | Deep links\n"
-        f"🔥 Priority scoring active\n"
-        f"🔒 Rotating residential proxy\n\n"
+        f"🔥 Priority scoring active\n\n"
         "Commands:\n/start — this message\n/status — stats",
         parse_mode="Markdown"
     )
