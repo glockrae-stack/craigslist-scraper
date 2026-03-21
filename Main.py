@@ -1,11 +1,3 @@
-"""
-Virtual Broker Bot — main.py
-─────────────────────────────────────────────
-Craigslist:  Individual alert per listing (title, price, mileage, city)
-OfferUp:     Individual alert per city+category (direct deep link)
-Proxy:       WebShare rotating residential — US IPs, bypasses all blocks
-"""
-
 import asyncio
 import feedparser
 import logging
@@ -20,13 +12,12 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-TOKEN   = os.getenv("8761442506:AAGs-ec3RXZ_9O86DIxMCSlEjiN9r0ytLk4")  # Set this in your env vars
-CHAT_ID = 6549307194                   # Your chat ID (hardcoded safely)
-
+TOKEN   = "8761442506:AAGs-ec3RXZ_9O86DIxMCSlEjiN9r0ytLk4"
+CHAT_ID = "6549307194"
 DB_FILE = "seen_ids.txt"
 
 # ─────────────────────────────────────────────
-# PROXY CONFIG
+# PROXY (Webshare)
 # ─────────────────────────────────────────────
 PROXY_HOST = "p.webshare.io"
 PROXY_PORT = "80"
@@ -35,46 +26,30 @@ PROXY_PASS = "tde8ndie2iu8"
 PROXY_URL  = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
 
 # ─────────────────────────────────────────────
+# USER AGENTS
+# ─────────────────────────────────────────────
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/118.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 Version/16.0 Mobile Safari/604.1",
+]
+
+# ─────────────────────────────────────────────
 # CITIES
 # ─────────────────────────────────────────────
 CL_CITIES = {
-    "Phoenix": "phoenix",
-    "Los Angeles": "losangeles",
-    "San Diego": "sandiego",
-    "SF Bay": "sfbay",
-    "Colorado Springs": "cosprings",
-    "Washington DC": "washingtondc",
-    "Atlanta": "atlanta",
     "Chicago": "chicago",
-    "New Orleans": "neworleans",
-    "Boston": "boston",
-    "Detroit": "detroit",
-    "Minneapolis": "minneapolis",
-    "Las Vegas": "lasvegas",
-    "Albuquerque": "albuquerque",
-    "New York": "newyork",
-    "Portland": "portland",
     "Dallas": "dallas",
+    "Atlanta": "atlanta",
+    "Phoenix": "phoenix",
 }
 
 OU_CITIES = {
-    "Phoenix": "phoenix-az",
-    "Los Angeles": "los-angeles-ca",
-    "San Diego": "san-diego-ca",
-    "SF Bay": "san-francisco-ca",
-    "Colorado Springs": "colorado-springs-co",
-    "Washington DC": "washington-dc",
-    "Atlanta": "atlanta-ga",
     "Chicago": "chicago-il",
-    "New Orleans": "new-orleans-la",
-    "Boston": "boston-ma",
-    "Detroit": "detroit-mi",
-    "Minneapolis": "minneapolis-mn",
-    "Las Vegas": "las-vegas-nv",
-    "Albuquerque": "albuquerque-nm",
-    "New York": "new-york-ny",
-    "Portland": "portland-or",
     "Dallas": "dallas-tx",
+    "Atlanta": "atlanta-ga",
+    "Phoenix": "phoenix-az",
 }
 
 OU_CATEGORIES = {
@@ -84,79 +59,165 @@ OU_CATEGORIES = {
 }
 
 def ou_link(slug: str, query: str) -> str:
-    return f"https://offerup.com/search/?q={query}&location={slug}&delivery_param=p&sort=-p"
+    return f"https://offerup.com/search/?q={query}&location={slug}&sort=-p"
 
 # ─────────────────────────────────────────────
 # LOGGING
 # ─────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.WARNING)
 
 # ─────────────────────────────────────────────
 # SEEN IDS
 # ─────────────────────────────────────────────
-def load_seen_ids() -> set:
+def load_seen_ids():
     if os.path.exists(DB_FILE):
         with open(DB_FILE, "r") as f:
-            return set(line.strip() for line in f if line.strip())
+            return set(line.strip() for line in f)
     return set()
 
-def mark_seen(lid: str):
+def mark_seen(lid):
     with open(DB_FILE, "a") as f:
         f.write(f"{lid}\n")
 
 seen_ids = load_seen_ids()
-log.info("Loaded %d seen IDs", len(seen_ids))
 
 # ─────────────────────────────────────────────
-# PARSERS
+# FETCH
 # ─────────────────────────────────────────────
-def extract_price(text: str) -> str:
-    paren = re.search(r'\s*(\$[\d,]+)\s*', text)
-    if paren:
-        return paren.group(1)
-    bare = re.search(r'\$[\d,]+', text)
-    if bare:
-        return bare.group(0)
-    return ""
+def fetch_feed(url):
+    ua = random.choice(USER_AGENTS)
 
-def extract_mileage(text: str) -> str:
-    patterns = [
-        r'odometer[:\s]+([0-9,]+)',
-        r'([0-9,]+)\s*(?:miles|mi\b)',
+    proxy_handler = urllib.request.ProxyHandler({
+        "http": PROXY_URL,
+        "https": PROXY_URL,
+    })
+
+    opener = urllib.request.build_opener(proxy_handler)
+
+    opener.addheaders = [
+        ("User-Agent", ua),
+        ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+        ("Accept-Language", "en-US,en;q=0.9"),
+        ("Connection", "keep-alive"),
+        ("Upgrade-Insecure-Requests", "1"),
     ]
-    for pat in patterns:
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            raw = m.group(1).replace(",", "")
-            try:
-                return f"{int(raw):,} mi"
-            except:
-                pass
-    return ""
+
+    res = opener.open(url, timeout=15)
+    return feedparser.parse(res.read())
 
 # ─────────────────────────────────────────────
-# ALERT SENDER
+# ALERT
 # ─────────────────────────────────────────────
-async def send_alert(app, title: str, link: str, city: str, price: str = "", mileage: str = ""):
-    parts = []
-    if price:
-        parts.append(f"💰 {price}")
-    if mileage:
-        parts.append(f"🛣️ {mileage}")
-    parts.append(f"🏙️ {city}")
+async def send_alert(app, title, link, city):
+    msg = f"*{title.upper()}*\n🏙️ {city}"
 
-    msg = f"*{title.upper()}*\n{' • '.join(parts)}"
-    kb  = InlineKeyboardMarkup([[InlineKeyboardButton("⚡ OPEN PULSE", url=link)]])
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("OPEN", url=link)]
+    ])
 
     await app.bot.send_message(
-        CHAT_ID, msg,
+        CHAT_ID,
+        msg,
         parse_mode="Markdown",
         reply_markup=kb,
         disable_web_page_preview=True
     )
+
+# ─────────────────────────────────────────────
+# HUMAN DELAY
+# ─────────────────────────────────────────────
+async def human_delay():
+    delay = random.uniform(6, 12)
+
+    if random.random() < 0.2:
+        delay += random.uniform(10, 25)
+
+    await asyncio.sleep(delay)
+
+# ─────────────────────────────────────────────
+# CRAIGSLIST LOOP
+# ─────────────────────────────────────────────
+async def craigslist_loop(app):
+    loop = asyncio.get_event_loop()
+
+    while True:
+        for city, slug in CL_CITIES.items():
+            urls = [
+                f"https://{slug}.craigslist.org/search/cto?format=rss",
+                f"https://{slug}.craigslist.org/search/boo?format=rss",
+                f"https://{slug}.craigslist.org/search/zip?format=rss",
+            ]
+
+            for url in urls:
+                try:
+                    feed = await loop.run_in_executor(None, partial(fetch_feed, url))
+
+                    for entry in feed.entries:
+                        eid = getattr(entry, "id", entry.link)
+
+                        if eid in seen_ids:
+                            continue
+
+                        await send_alert(app, entry.title, entry.link, city)
+
+                        seen_ids.add(eid)
+                        mark_seen(eid)
+
+                except Exception as e:
+                    log.error(f"CL ERROR [{city}]: {e}")
+
+                await human_delay()
+
+        await asyncio.sleep(120)
+
+# ─────────────────────────────────────────────
+# OFFERUP LOOP
+# ─────────────────────────────────────────────
+async def offerup_loop(app):
+    while True:
+        for city, slug in OU_CITIES.items():
+            for cat, title in OU_CATEGORIES.items():
+                key = f"{slug}_{cat}"
+
+                if key in seen_ids:
+                    continue
+
+                link = ou_link(slug, cat)
+
+                await send_alert(app, f"{title} — {city}", link, city)
+
+                seen_ids.add(key)
+                mark_seen(key)
+
+                await human_delay()
+
+        await asyncio.sleep(300)
+
+# ─────────────────────────────────────────────
+# COMMAND
+# ─────────────────────────────────────────────
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Bot running.")
+
+# ─────────────────────────────────────────────
+# START
+# ─────────────────────────────────────────────
+async def post_init(app):
+    asyncio.create_task(craigslist_loop(app))
+    asyncio.create_task(offerup_loop(app))
+
+def main():
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", start))
+
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
