@@ -47,8 +47,6 @@ seen = load_seen()
 async def fetch_feed(url: str):
     headers = {"User-Agent": random.choice(USER_AGENTS)}
     selected_proxy = random.choice(PROXIES)
-    
-    # Using 'proxy' (singular) for httpx compatibility
     async with httpx.AsyncClient(proxy=selected_proxy, timeout=30.0, follow_redirects=True) as client:
         await asyncio.sleep(random.uniform(1, 2))
         resp = await client.get(url, headers=headers)
@@ -73,22 +71,17 @@ async def check_city(app, city_label, city_slug, semaphore):
                 for entry in entries:
                     eid = getattr(entry, "id", entry.link)
                     if eid in seen: continue
-
                     published = entry.get("published_parsed")
                     if published:
                         dt = datetime.fromtimestamp(time.mktime(published))
-                        if (now - dt) > timedelta(minutes=MAX_AGE_MINUTES):
-                            continue
-
+                        if (now - dt) > timedelta(minutes=MAX_AGE_MINUTES): continue
                     title = entry.title.strip()
                     price_match = re.search(r'\$[\d,]+', title)
                     price = price_match.group(0) if price_match else "N/A"
-
                     await send_alert(app, title, entry.link, city_label, price)
-                    seen.add(eid)
-                    mark_seen(eid)
+                    seen.add(eid); mark_seen(eid)
             except Exception: pass
-            await asyncio.sleep(random.uniform(3, 7))
+            await asyncio.sleep(random.uniform(2, 4))
 
 async def scan_loop(app):
     semaphore = asyncio.Semaphore(1) 
@@ -98,22 +91,21 @@ async def scan_loop(app):
         random.shuffle(city_items)
         for label, slug in city_items:
             await check_city(app, label, slug, semaphore)
-        
-        wait_time = random.randint(600, 900)
-        print(f"Sweep finished. Resting {wait_time // 60} mins.")
-        await asyncio.sleep(wait_time)
+        await asyncio.sleep(random.randint(300, 600))
 
 async def post_init(app):
+    # This forcefully drops any existing connections
+    await app.bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(scan_loop(app))
 
 def main():
     try:
-        # Building the application correctly
         app = Application.builder().token(TOKEN).post_init(post_init).build()
-        print("🤖 Bot instance authorized. Starting polling...")
-        app.run_polling(drop_pending_updates=True)
+        print("🤖 Bot starting...")
+        # Added drop_pending_updates here as a secondary safeguard
+        app.run_polling(drop_pending_updates=True, close_loop=False)
     except Exception as e:
-        print(f"FATAL ERROR: {e}")
+        print(f"FATAL: {e}")
 
 if __name__ == "__main__":
     main()
