@@ -1,41 +1,35 @@
-from telegram import Update, Bot
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from flask import Flask, request
+# Main.py
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+import logging
+import asyncio
 
-# ---------------- CONFIG ----------------
+# ---- CONFIG ----
 BOT_TOKEN = "8761442506:AAFO9mZHLhxlEFf0yjW0YArbc0lLmOBQg9Y"
-WEBHOOK_PATH = f"/{BOT_TOKEN}"      # path Telegram will POST to
-PORT = 8000                         # Railway will expose this port
-# ---------------------------------------
 
-# Initialize Flask app
-app = Flask(__name__)
+# ---- LOGGING ----
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
-# Bot application
-application = ApplicationBuilder().token(BOT_TOKEN).build()
-bot = application.bot
-
-# --------- COMMAND HANDLERS ----------
+# ---- HANDLERS ----
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot is online ✅")
+    await update.message.reply_text("Bot is running! ✅")
 
-application.add_handler(CommandHandler("start", start))
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"You said: {update.message.text}")
 
-# --------- FLASK WEBHOOK ROUTE --------
-@app.route(WEBHOOK_PATH, methods=["POST"])
-def webhook():
-    update = Update.de_json(request.get_json(force=True), bot)
-    application.update_queue.put(update)  # push update to PTB application
-    return "ok"
+# ---- MAIN ----
+async def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-# --------- SET WEBHOOK ON TELEGRAM ----
-async def set_webhook():
-    url = f"https://YOUR_RAILWAY_APP_URL{WEBHOOK_PATH}"  # replace with Railway app URL
-    await bot.set_webhook(url)
-    print(f"Webhook set to {url}")
+    # Add handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
 
-# --------- RUN BOT -------------------
+    # Start polling
+    await app.run_polling(poll_interval=2, allowed_updates=None)
+
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(set_webhook())
-    app.run(host="0.0.0.0", port=PORT)
+    asyncio.run(main())
