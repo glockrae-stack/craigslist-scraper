@@ -1,10 +1,10 @@
 """
 Virtual Broker Bot — main.py
 ─────────────────────────────────────────────
-Craigslist:  Routes through rss2json.com (free RSS proxy)
-             Craigslist sees rss2json's IP, not Railway's
-             No proxy cost, no blocks
-OfferUp:     Deep link alerts per city
+Craigslist:  Rotates between 3 free RSS proxy services
+             so no single one gets rate limited
+             Real listing titles + price + mileage
+OfferUp:     Individual deep link alerts per city
 Priority:    Scoring on every listing
 """
 
@@ -24,16 +24,13 @@ TOKEN   = "8761442506:AAGs-ec3RXZ_9O86DIxMCSlEjiN9r0ytLk4"
 CHAT_ID = "6549307194"
 DB_FILE = "seen_ids.txt"
 
-# rss2json free API — proxies RSS feeds, CL sees their IP not ours
-RSS2JSON = "https://api.rss2json.com/v1/api.json"
-
 # Wave timing
 BREAK_MIN      = 60
-BREAK_MAX      = 180
-LONG_BREAK_MIN = 360
-LONG_BREAK_MAX = 720
-REQ_DELAY_MIN  = 15
-REQ_DELAY_MAX  = 35
+BREAK_MAX      = 120
+LONG_BREAK_MIN = 300
+LONG_BREAK_MAX = 600
+REQ_DELAY_MIN  = 12
+REQ_DELAY_MAX  = 25
 
 # ─────────────────────────────────────────────
 # CITIES
@@ -195,27 +192,74 @@ async def send_alert(app, title: str, link: str, city: str, price: str = "", mil
     log.info("%s[%s] %s", "🔥 " if priority else "✅ ", city, title[:60])
 
 # ─────────────────────────────────────────────
-# CRAIGSLIST FETCH via rss2json (free proxy)
+# CRAIGSLIST FETCH
+# Tries 3 different free RSS proxy services
+# rotates so none get rate limited
 # ─────────────────────────────────────────────
 async def fetch_cl_feed(client: httpx.AsyncClient, rss_url: str) -> list:
-    """
-    Fetches Craigslist RSS via rss2json.com
-    CL sees rss2json's IP — not Railway's blocked IP
-    Returns list of {title, link, guid, description} dicts
-    """
-    try:
-        resp = await client.get(
-            RSS2JSON,
-            params={"rss_url": rss_url, "api_key": "", "count": 50},
-            timeout=20
-        )
-        data = resp.json()
-        if data.get("status") != "ok":
-            log.warning("rss2json bad status: %s", data.get("status"))
-            return []
-        return data.get("items", [])
-    except Exception as e:
-        raise e
+    proxies = [
+        # Service 1: rss2json
+        lambda url: (
+            "https://api.rss2json.com/v1/api.json",
+            {"rss_url": url, "count": 50},
+            "rss2json"
+        ),
+        # Service 2: Toptal feed2json
+        lambda url: (
+            f"https://www.toptal.com/developers/feed2json/convert?url={url}",
+            {},
+            "toptal"
+        ),
+        # Service 3: x2j.dev
+        lambda url: (
+            "https://x2j.dev/api/rss",
+            {"url": url},
+            "x2j"
+        ),
+    ]
+
+    random.shuffle(proxies)
+
+    for proxy_fn in proxies:
+        endpoint, params, name = proxy_fn(rss_url)
+        try:
+            resp = await client.get(endpoint, params=params, timeout=20)
+            if resp.status_code != 200:
+                continue
+
+            data = resp.json()
+
+            # rss2json format
+            if name == "rss2json":
+                if data.get("status") != "ok":
+                    continue
+                items = data.get("items", [])
+                if items:
+                    log.info("CL via rss2json → %d items", len(items))
+                    return [{"title": i.get("title",""), "link": i.get("link",""), "guid": i.get("guid",""), "description": i.get("description","")} for i in items]
+
+            # Toptal format: returns RSS as JSON with channel.item array
+            elif name == "toptal":
+                channel = data.get("rss", {}).get("channel", {})
+                raw_items = channel.get("item", [])
+                if isinstance(raw_items, dict):
+                    raw_items = [raw_items]
+                if raw_items:
+                    log.info("CL via toptal → %d items", len(raw_items))
+                    return [{"title": i.get("title",""), "link": i.get("link",""), "guid": i.get("guid",""), "description": i.get("description","")} for i in raw_items]
+
+            # x2j format
+            elif name == "x2j":
+                raw_items = data.get("items", [])
+                if raw_items:
+                    log.info("CL via x2j → %d items", len(raw_items))
+                    return [{"title": i.get("title",""), "link": i.get("link",""), "guid": i.get("guid",""), "description": i.get("description","")} for i in raw_items]
+
+        except Exception as e:
+            log.warning("RSS proxy %s failed: %s", name, e)
+            continue
+
+    return []
 
 # ─────────────────────────────────────────────
 # CRAIGSLIST WAVE
@@ -272,8 +316,6 @@ async def craigslist_wave(app, feed_type: str, client: httpx.AsyncClient):
             continue
 
         delay = random.randint(REQ_DELAY_MIN, REQ_DELAY_MAX)
-        if random.random() < 0.1:
-            delay += random.randint(20, 40)
         await asyncio.sleep(delay)
 
     for title, link, city, price, mileage in high_priority:
@@ -288,7 +330,7 @@ async def craigslist_wave(app, feed_type: str, client: httpx.AsyncClient):
 # MAIN CRAIGSLIST LOOP
 # ─────────────────────────────────────────────
 async def craigslist_loop(app):
-    log.info("✅ Craigslist loop started via rss2json proxy")
+    log.info("✅ Craigslist loop started — rotating RSS proxies")
 
     async with httpx.AsyncClient() as client:
         while True:
@@ -303,8 +345,6 @@ async def craigslist_loop(app):
                 await asyncio.sleep(break_time)
 
             long_break = random.randint(LONG_BREAK_MIN, LONG_BREAK_MAX)
-            if random.random() < 0.2:
-                long_break += random.randint(300, 600)
             log.info("💤 Long break: %ds", long_break)
             await asyncio.sleep(long_break)
 
@@ -338,7 +378,7 @@ async def offerup_loop(app):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⚡ *Virtual Broker Bot is live.*\n\n"
-        f"🚗 Craigslist: {len(CL_CITIES)} cities | Free RSS proxy\n"
+        f"🚗 Craigslist: {len(CL_CITIES)} cities | Rotating RSS proxies\n"
         f"📲 OfferUp: {len(OU_CITIES)} cities | Deep links\n"
         f"🔥 Priority scoring active\n\n"
         "Commands:\n/start — this message\n/status — stats",
