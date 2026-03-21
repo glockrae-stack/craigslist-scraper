@@ -2,8 +2,8 @@
 Virtual Broker Bot — main.py
 ─────────────────────────────────────────────
 Craigslist:  Individual alert per listing (title, price, mileage, city)
-OfferUp:     Individual alert per city+category (direct deep link, same format)
-Both fire the same clean alert format with ⚡ OPEN PULSE button.
+OfferUp:     Individual alert per city+category (direct deep link)
+Proxy:       WebShare rotating residential — US IPs, bypasses all blocks
 """
 
 import asyncio
@@ -12,6 +12,7 @@ import logging
 import os
 import random
 import re
+import urllib.request
 from functools import partial
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -23,15 +24,16 @@ TOKEN   = "8761442506:AAFPCQyaKuSbjuc4s8SwzKYvMAFHQ5QlgXY"
 CHAT_ID = "6549307194"
 DB_FILE = "seen_ids.txt"
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
+# ─────────────────────────────────────────────
+# WEBSHARE ROTATING RESIDENTIAL PROXY
+# Rotates automatically — every request hits
+# a different US residential IP
+# ─────────────────────────────────────────────
+PROXY_HOST = "p.webshare.io"
+PROXY_PORT = "80"
+PROXY_USER = "oyexvpgk-ad-ae-af-ag-rotate"
+PROXY_PASS = "tde8ndie2iu8"
+PROXY_URL  = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
 
 # ─────────────────────────────────────────────
 # CITIES
@@ -76,11 +78,10 @@ OU_CITIES = {
     "Dallas":           "dallas-tx",
 }
 
-# OfferUp categories — cars, boats, free
 OU_CATEGORIES = {
-    "cars":  ("🚗 CARS BY OWNER",  "cars"),
-    "boats": ("⛵ BOATS BY OWNER", "boats"),
-    "free":  ("🆓 FREE STUFF",     "free"),
+    "cars":  "🚗 CARS BY OWNER",
+    "boats": "⛵ BOATS BY OWNER",
+    "free":  "🆓 FREE STUFF",
 }
 
 def ou_link(slug: str, query: str) -> str:
@@ -164,9 +165,18 @@ async def send_alert(app, title: str, link: str, city: str, price: str = "", mil
 
 # ─────────────────────────────────────────────
 # CRAIGSLIST LOOP
+# Feedparser routed through residential proxy
 # ─────────────────────────────────────────────
-def _fetch_feed(url: str):
-    return feedparser.parse(url, request_headers=HEADERS)
+def _fetch_feed(url: str) -> object:
+    proxy_handler = urllib.request.ProxyHandler({
+        "http":  PROXY_URL,
+        "https": PROXY_URL,
+    })
+    opener   = urllib.request.build_opener(proxy_handler)
+    opener.addheaders = [("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")]
+    response = opener.open(url, timeout=15)
+    content  = response.read()
+    return feedparser.parse(content)
 
 async def craigslist_loop(app):
     loop = asyncio.get_event_loop()
@@ -215,41 +225,28 @@ async def craigslist_loop(app):
 
 # ─────────────────────────────────────────────
 # OFFERUP LOOP
-# One alert per city per category — same format
-# as Craigslist but links straight to OfferUp
-# search filtered to pickup only + newest first
+# Individual alert per city per category
 # ─────────────────────────────────────────────
 async def offerup_loop(app):
     log.info("✅ OfferUp loop started — %d cities", len(OU_CITIES))
 
     while True:
         for city_label, slug in OU_CITIES.items():
-            for cat_key, (cat_title, cat_query) in OU_CATEGORIES.items():
-                # Use city+category as ID so it fires once per cycle
-                alert_id = f"ou_{slug}_{cat_key}"
+            for cat_query, cat_title in OU_CATEGORIES.items():
+                alert_id = f"ou_{slug}_{cat_query}"
                 if alert_id in seen_ids:
                     continue
 
                 link = ou_link(slug, cat_query)
-
-                await send_alert(
-                    app,
-                    title   = f"{cat_title} — {city_label}",
-                    link    = link,
-                    city    = city_label,
-                )
-
+                await send_alert(app, f"{cat_title} — {city_label}", link, city_label)
                 seen_ids.add(alert_id)
                 mark_seen(alert_id)
-
                 await asyncio.sleep(random.uniform(2, 4))
 
         log.info("📲 OU cycle done. Sleeping 300s...")
-        # Clear OU seen IDs every cycle so links refresh
         ou_keys = [k for k in seen_ids if k.startswith("ou_")]
         for k in ou_keys:
             seen_ids.discard(k)
-
         await asyncio.sleep(300)
 
 # ─────────────────────────────────────────────
@@ -259,7 +256,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⚡ *Virtual Broker Bot is live.*\n\n"
         f"🚗 Craigslist: {len(CL_CITIES)} cities | CTO + BOO + ZIP\n"
-        f"📲 OfferUp: {len(OU_CITIES)} cities | Cars + Boats + Free\n\n"
+        f"📲 OfferUp: {len(OU_CITIES)} cities | Cars + Boats + Free\n"
+        f"🔒 Rotating US residential proxies\n\n"
         "Commands:\n/start — this message\n/status — stats",
         parse_mode="Markdown"
     )
