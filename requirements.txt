@@ -1,4 +1,4 @@
-python-telegram-bot[job-queue]
-httpx
-feedparser
+python-telegram-bot
 aiohttp
+requests
+beautifulsoup4
