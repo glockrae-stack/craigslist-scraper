@@ -1,3 +1,1 @@
-python-telegram-bot
-feedparser
-httpx
+python-telegram-bot==20.3
