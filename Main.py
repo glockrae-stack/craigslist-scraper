@@ -1,20 +1,19 @@
 import asyncio
 import os
-import random
 import threading
+import httpx
+import feedparser
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application
-import httpx
-import feedparser
 
-# ─── NEW CONFIG ───
+# ─── CONFIG ───
 TOKEN   = "8601205854:AAF5lME-PScrRA__JxfRP1PRJ0bp00IkSBU" 
 CHAT_ID = "8761442506"
 DB_FILE = "seen_ids.txt"
 
-# ─── HEARTBEAT SERVER (For Railway Health Checks) ───
+# ─── STEP 1: THE HEARTBEAT (Keeps Railway Happy) ───
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -26,7 +25,7 @@ def run_health_server():
     server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
     server.serve_forever()
 
-# ─── SCANNER SETTINGS ───
+# ─── STEP 2: THE SCANNER ───
 CL_CITIES = {"SF": "sfbay", "LA": "losangeles", "Chi": "chicago", "Mia": "miami", "Phx": "phoenix"}
 CATEGORIES = {"cars": "cta", "boats": "boo"}
 
@@ -40,44 +39,52 @@ def mark_seen(lid):
 
 seen = load_seen()
 
-async def check_cl_city(app, label, slug):
-    for cat_name, cat_code in CATEGORIES.items():
-        url = f"https://{slug}.craigslist.org/search/{cat_code}?format=rss"
-        try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.get(url)
-                feed = feedparser.parse(resp.text)
-                for entry in feed.entries[:5]:
-                    eid = getattr(entry, "id", entry.link)
-                    if eid in seen: continue
-                    
-                    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⚡ VIEW", url=entry.link)]])
-                    await app.bot.send_message(CHAT_ID, f"🔔 *NEW {cat_name.upper()}* ({label})\n{entry.title}", parse_mode="Markdown", reply_markup=kb)
-                    seen.add(eid)
-                    mark_seen(eid)
-        except: continue
+async def check_cl(app):
+    for label, slug in CL_CITIES.items():
+        for cat_name, cat_code in CATEGORIES.items():
+            url = f"https://{slug}.craigslist.org/search/{cat_code}?format=rss"
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    resp = await client.get(url)
+                    feed = feedparser.parse(resp.text)
+                    for entry in feed.entries[:5]:
+                        eid = getattr(entry, "id", entry.link)
+                        if eid in seen: continue
+                        
+                        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⚡ VIEW DEAL", url=entry.link)]])
+                        await app.bot.send_message(CHAT_ID, f"🚗 *NEW {cat_name.upper()}* ({label})\n{entry.title}", parse_mode="Markdown", reply_markup=kb)
+                        seen.add(eid)
+                        mark_seen(eid)
+            except: continue
+        await asyncio.sleep(2) # Small gap between cities
 
+# ─── STEP 3: THE MAIN LOOP ───
 async def main():
-    print("🛰 Starting Heartbeat Server...")
+    # Start the web server first so Railway sees a "Success"
     threading.Thread(target=run_health_server, daemon=True).start()
-    
-    print("🤖 Initializing NEW Bot...")
+    print("📡 Heartbeat server active on port 8080.")
+
+    # CRITICAL: Wait 20 seconds before starting the bot.
+    # This ensures Railway has killed the "old" bot session.
+    print("⏳ Waiting for old sessions to clear (20s)...")
+    await asyncio.sleep(20)
+
+    print("🤖 Initializing Bot...")
     app = Application.builder().token(TOKEN).build()
     
-    # This specifically stops any "Ghost" bots from blocking this one
+    # Kick any other instances off the token
     await app.initialize()
     await app.bot.delete_webhook(drop_pending_updates=True)
-    
     await app.start()
-    print("🚀 NEW BOT IS ONLINE. Starting scans...")
     
+    print("🚀 BOT IS LIVE. No more conflicts.")
+    await app.bot.send_message(CHAT_ID, "✅ Bot Restarted! Scans are running now.")
+
     while True:
         try:
-            for label, slug in CL_CITIES.items():
-                await check_cl_city(app, label, slug)
-                await asyncio.sleep(5) 
-            print(f"✅ Sweep done at {datetime.now().strftime('%H:%M:%S')}")
-            await asyncio.sleep(600) # Wait 10 minutes between full sweeps
+            await check_cl(app)
+            print(f"✅ Sweep complete at {datetime.now().strftime('%H:%M:%S')}")
+            await asyncio.sleep(600) # Wait 10 mins
         except Exception as e:
             print(f"⚠️ Loop Error: {e}")
             await asyncio.sleep(30)
