@@ -161,8 +161,8 @@ async def send_alert(bot, session, listing):
         return False
 
 # ─── SCAN CRAIGSLIST ───
-async def scan_craigslist(session, now, cutoff):
-    """Scan all CL cities for FREE, CARS, BOATS"""
+async def scan_craigslist(session):
+    """Scan all CL cities for FREE, CARS, BOATS — dedup via seen_ids"""
     listings = []
     
     categories = [
@@ -196,7 +196,7 @@ async def scan_craigslist(session, now, cutoff):
                         if lid in seen:
                             continue
                         
-                        # Get posting time (normalize to UTC)
+                        # Try to get posting time (best-effort, not required)
                         post_time = None
                         time_elem = r.select_one("time")
                         if time_elem:
@@ -207,14 +207,9 @@ async def scan_craigslist(session, now, cutoff):
                                     if parsed.tzinfo is not None:
                                         post_time = parsed.astimezone(timezone.utc).replace(tzinfo=None)
                                     else:
-                                        # CL times without tz — assume UTC
                                         post_time = parsed
                                 except Exception as e:
                                     log.warning(f"CL time parse error: {dt_str} -> {e}")
-                        
-                        # SKIP if no time or older than cutoff
-                        if not post_time or post_time < cutoff:
-                            continue
                         
                         title_el = r.select_one(".title")
                         title = title_el.get_text(strip=True) if title_el else "Item"
@@ -234,8 +229,8 @@ async def scan_craigslist(session, now, cutoff):
     return listings
 
 # ─── SCAN OFFERUP ───
-async def scan_offerup(session, now, cutoff):
-    """Scan all OU locations for FREE, CARS, BOATS"""
+async def scan_offerup(session):
+    """Scan all OU locations for FREE, CARS, BOATS — dedup via seen_ids"""
     listings = []
     
     categories = [
@@ -279,14 +274,13 @@ async def scan_offerup(session, now, cutoff):
                         if not lid_raw or not title:
                             continue
                         
-                        # Get posting time (normalize to UTC)
+                        # Try to get posting time (best-effort, not required)
                         post_time = None
                         created = listing.get("createdDate", listing.get("postedDate", listing.get("listDate", "")))
                         if created:
                             try:
                                 if isinstance(created, (int, float)):
                                     ts = created / 1000 if created > 1e10 else created
-                                    # fromtimestamp with UTC to avoid local tz issues
                                     post_time = datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None)
                                 else:
                                     parsed = datetime.fromisoformat(str(created))
@@ -297,12 +291,15 @@ async def scan_offerup(session, now, cutoff):
                             except Exception as e:
                                 log.warning(f"OU time parse error: {created} -> {e}")
                         
-                        # SKIP if no time or older than cutoff
-                        if not post_time or post_time < cutoff:
-                            continue
-                        
+                        # Extract image — handle both old ({url:...}) and new API format
                         img = listing.get("image", {})
-                        img_url = img.get("url", "") if isinstance(img, dict) else ""
+                        if isinstance(img, dict):
+                            img_url = img.get("url", "")
+                        elif isinstance(img, str):
+                            img_url = img
+                        else:
+                            img_url = ""
+                        
                         price = listing.get("price", 0)
                         try:
                             price_str = f"${int(float(price))}" if price else "FREE"
@@ -329,21 +326,20 @@ async def do_scan(bot):
     Main scan:
     1. Scan all CL cities (FREE, CARS, BOATS)
     2. Scan all OU locations (FREE, CARS, BOATS)
-    3. Filter to only listings within 40 minutes
-    4. Sort by posting time (oldest first)
-    5. Send alerts in that order
+    3. Dedup via seen_ids (timestamps no longer available in search results)
+    4. Sort by posting time when available, otherwise by source order
+    5. Send alerts
     """
     now = datetime.utcnow()
-    cutoff = now - timedelta(minutes=MAX_AGE_MINUTES)
-    log.info(f"Scan start — now(UTC)={now.strftime('%H:%M:%S')}, cutoff={cutoff.strftime('%H:%M:%S')}")
+    log.info(f"Scan start — now(UTC)={now.strftime('%H:%M:%S')}")
     
     connector = aiohttp.TCPConnector(force_close=True, limit=10)
     async with aiohttp.ClientSession(connector=connector) as session:
         
         # Collect from both sources
-        cl_listings = await scan_craigslist(session, now, cutoff)
-        ou_listings = await scan_offerup(session, now, cutoff)
-        log.info(f"Found {len(cl_listings)} CL + {len(ou_listings)} OU listings within {MAX_AGE_MINUTES}m")
+        cl_listings = await scan_craigslist(session)
+        ou_listings = await scan_offerup(session)
+        log.info(f"Found {len(cl_listings)} new CL + {len(ou_listings)} new OU listings")
         
         # Combine all listings
         all_listings = cl_listings + ou_listings
@@ -351,8 +347,8 @@ async def do_scan(bot):
         if not all_listings:
             return 0
         
-        # Sort by posting time (oldest first - so alerts go in order)
-        all_listings.sort(key=lambda x: x["time"])
+        # Sort: listings with time first (oldest→newest), then those without
+        all_listings.sort(key=lambda x: (x["time"] is None, x["time"] or datetime.min))
         
         # Fetch CL images
         for listing in all_listings:
@@ -360,7 +356,7 @@ async def do_scan(bot):
                 listing["image"] = await fetch_cl_image(session, listing["link"])
                 await asyncio.sleep(0.05)
         
-        # Send alerts in posting order
+        # Send alerts
         sent = 0
         for listing in all_listings:
             if listing["id"] in seen:
@@ -388,8 +384,7 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔍 *SCANNING...*\n\n"
         f"📋 {len(CL_CITIES)} CL cities\n"
         f"🟠 {len(OU_LOCS)} OU locations\n"
-        "📦 FREE • CARS • BOATS\n"
-        f"⏰ Only last {MAX_AGE_MINUTES} min",
+        "📦 FREE • CARS • BOATS",
         parse_mode="Markdown"
     )
     
@@ -413,7 +408,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/scan - Scan now\n"
         f"/status - Status\n\n"
         f"🔄 Auto-scan: every {SCAN_INTERVAL}s\n"
-        f"⏰ Only listings within {MAX_AGE_MINUTES} min",
+        f"🔁 Dedup via seen IDs",
         parse_mode="Markdown"
     )
 
@@ -423,14 +418,13 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 *STATUS*\n\n"
         f"✅ Running\n"
         f"📂 Seen: {len(seen)}\n"
-        f"🔄 Interval: {SCAN_INTERVAL}s\n"
-        f"⏰ Max age: {MAX_AGE_MINUTES} min",
+        f"🔄 Interval: {SCAN_INTERVAL}s",
         parse_mode="Markdown"
     )
 
 # ─── AUTO SCANNER ───
 async def auto_scanner(bot):
-    log.info(f"🚀 Auto-scanner: every {SCAN_INTERVAL}s, max age {MAX_AGE_MINUTES}m")
+    log.info(f"🚀 Auto-scanner: every {SCAN_INTERVAL}s, dedup via seen_ids")
     
     while not shutdown_event.is_set():
         if not scan_running:
@@ -504,9 +498,8 @@ async def main():
         CHAT_ID,
         f"🚀 *BOT STARTED*\n\n"
         f"🔄 Scanning every {SCAN_INTERVAL}s\n"
-        f"⏰ Only listings within {MAX_AGE_MINUTES} min\n"
         f"📦 FREE • CARS • BOATS\n"
-        f"📤 Sorted by post time",
+        f"🔁 Dedup via seen IDs ({len(seen)} tracked)",
         parse_mode="Markdown"
     )
     
