@@ -4,7 +4,7 @@ import re
 import random
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
 import aiohttp
 from aiohttp import web
@@ -12,24 +12,55 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ─── LOGGING ───
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 log = logging.getLogger("scanner")
 
 # ─── CONFIG ───
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "8712723612:AAFMSfy8dOyEpOoE-vQXAaMM2oIKVs7zsNA")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6549307194")
-DB_FILE = "seen_ids.txt"
+DB_FILE = "seen_ids.json"  # Changed to JSON for time-based tracking
 
 # ─── TIMING ───
-MAX_AGE_MINUTES = 40   # Only alert listings within 40 minutes (when timestamp available)
-SCAN_INTERVAL = 30     # Scan every 30 seconds
+MAX_AGE_MINUTES = 40       # Only alert listings within 40 minutes (when timestamp available)
+SCAN_INTERVAL = 30         # Scan every 30 seconds
+SEEN_EXPIRY_HOURS = 6      # Expire seen IDs after 6 hours (allows re-alerting old listings)
 
-# ─── PROXY ───
-PROXY_PASSWORD = "tde8ndie2iu8"
-PROXY_USERS = ["oyexvpgk-us-1", "oyexvpgk-us-5", "oyexvpgk-us-10", "oyexvpgk-us-15", "oyexvpgk-us-20"]
+# ─── FREE ITEM SETTINGS ───
+FREE_KEYWORDS = ["free", "curb", "curbside", "giveaway", "giving away", "must go", "pick up only", "free stuff"]
+PRIORITY_FREE = True       # Prioritize FREE items in alerts
+
+# ─── FREE PROXY LIST ───
+# Using free public proxies - refreshed from free proxy APIs
+FREE_PROXIES = []
+PROXY_FETCH_URL = "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=us&ssl=all&anonymity=all"
+LAST_PROXY_FETCH = None
+
+async def fetch_free_proxies(session):
+    """Fetch fresh free proxies from ProxyScrape API."""
+    global FREE_PROXIES, LAST_PROXY_FETCH
+    try:
+        async with session.get(PROXY_FETCH_URL, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status == 200:
+                text = await resp.text()
+                proxies = [f"http://{p.strip()}" for p in text.strip().split('\n') if p.strip()]
+                if proxies:
+                    FREE_PROXIES = proxies[:50]  # Keep top 50
+                    LAST_PROXY_FETCH = datetime.now(timezone.utc)
+                    log.info(f"Fetched {len(FREE_PROXIES)} free proxies")
+                    return True
+    except Exception as e:
+        log.warning(f"Failed to fetch free proxies: {e}")
+    return False
 
 def get_proxy():
-    return f"http://{random.choice(PROXY_USERS)}:{PROXY_PASSWORD}@p.webshare.io:80"
+    """Get a random free proxy, or None if none available."""
+    if FREE_PROXIES:
+        return random.choice(FREE_PROXIES)
+    return None
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"
 
@@ -60,29 +91,111 @@ OU_LOCS = {
     "Nashville": (36.1627, -86.7816, "37011"), "Philadelphia": (39.9526, -75.1652, "19019"),
 }
 
-# ─── SEEN IDs ───
-seen = set()
-if os.path.exists(DB_FILE):
-    with open(DB_FILE) as f:
-        seen = set(line.strip() for line in f if line.strip())
-log.info(f"Loaded {len(seen)} seen IDs")
+# ─── TIME-BASED SEEN IDs ───
+seen = {}  # {listing_id: timestamp_string}
+
+def load_seen():
+    """Load seen IDs with timestamps, expire old ones."""
+    global seen
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, 'r') as f:
+                data = json.load(f)
+                now = datetime.now(timezone.utc)
+                expiry = timedelta(hours=SEEN_EXPIRY_HOURS)
+                # Filter out expired entries
+                seen = {}
+                expired_count = 0
+                for lid, ts_str in data.items():
+                    try:
+                        ts = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                        if now - ts < expiry:
+                            seen[lid] = ts_str
+                        else:
+                            expired_count += 1
+                    except:
+                        pass
+                if expired_count > 0:
+                    log.info(f"Expired {expired_count} old seen IDs (>{SEEN_EXPIRY_HOURS}h)")
+        except json.JSONDecodeError:
+            log.warning("Could not parse seen_ids.json, starting fresh")
+            seen = {}
+    log.info(f"Loaded {len(seen)} active seen IDs")
+
+def save_seen():
+    """Save seen IDs to disk."""
+    with open(DB_FILE, 'w') as f:
+        json.dump(seen, f)
 
 def mark_seen(lid):
-    seen.add(lid)
-    with open(DB_FILE, "a") as f:
-        f.write(f"{lid}\n")
+    """Mark a listing as seen with current timestamp."""
+    seen[lid] = datetime.now(timezone.utc).isoformat()
+    # Save periodically (every 50 new entries)
+    if len(seen) % 50 == 0:
+        save_seen()
+
+def is_seen(lid):
+    """Check if listing was seen recently (within expiry window)."""
+    if lid not in seen:
+        return False
+    try:
+        ts = datetime.fromisoformat(seen[lid].replace('Z', '+00:00'))
+        if datetime.now(timezone.utc) - ts > timedelta(hours=SEEN_EXPIRY_HOURS):
+            del seen[lid]
+            return False
+        return True
+    except:
+        return False
 
 def cleanup_seen():
+    """Remove expired entries and save."""
     global seen
-    if len(seen) > 20000:
-        seen = set(list(seen)[-10000:])
-        with open(DB_FILE, "w") as f:
-            f.write("\n".join(seen))
+    now = datetime.now(timezone.utc)
+    expiry = timedelta(hours=SEEN_EXPIRY_HOURS)
+    old_count = len(seen)
+    seen = {lid: ts for lid, ts in seen.items() 
+            if datetime.now(timezone.utc) - datetime.fromisoformat(ts.replace('Z', '+00:00')) < expiry}
+    if old_count != len(seen):
+        log.info(f"Cleanup: {old_count} -> {len(seen)} seen IDs")
+    save_seen()
+
+# Load on startup
+load_seen()
 
 # ─── SCAN FLAG ───
 scan_running = False
 
 # ─── HELPERS ───
+def is_free_item(price_str, title=""):
+    """Enhanced FREE item detection."""
+    if not price_str:
+        return False
+    price_lower = price_str.lower().strip()
+    title_lower = title.lower() if title else ""
+    
+    # Direct price checks
+    if price_lower in ["free", "$0", "0", "$0.00", "0.00"]:
+        return True
+    
+    # Keyword checks in title
+    for keyword in FREE_KEYWORDS:
+        if keyword in title_lower:
+            return True
+    
+    # Check for $0 variants
+    if re.match(r'^\$?0(\.0+)?$', price_lower):
+        return True
+    
+    return False
+
+def format_price(price_str, title=""):
+    """Format price with better FREE detection."""
+    if is_free_item(price_str, title):
+        return "FREE"
+    if not price_str or price_str.strip() == "":
+        return "FREE"
+    return price_str
+
 async def fetch_cl_image(session, url):
     """Fetch og:image from a Craigslist listing page."""
     try:
@@ -92,8 +205,8 @@ async def fetch_cl_image(session, url):
                 match = re.search(r'<meta property="og:image" content="([^"]+)"', html)
                 if match:
                     return match.group(1)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug(f"Failed to fetch CL image: {e}")
     return ""
 
 def get_mileage(text):
@@ -111,35 +224,48 @@ def get_mileage(text):
 async def send_alert(bot, session, listing):
     """Send a single Telegram alert with image."""
     parts = []
-    if listing.get("price") and listing["price"] not in ["FREE", "$0", ""]:
-        parts.append(f"\U0001f4b0 {listing['price']}")
+    
+    is_free = is_free_item(listing.get("price", ""), listing.get("title", ""))
+    
+    if is_free:
+        parts.append("🆓 FREE")
+    elif listing.get("price") and listing["price"] not in ["FREE", "$0", ""]:
+        parts.append(f"💰 {listing['price']}")
+    
     if listing.get("mileage"):
-        parts.append(f"\U0001f6e3\ufe0f {listing['mileage']}")
-    parts.append(f"\U0001f3d9\ufe0f {listing['location']}")
+        parts.append(f"🛣️ {listing['mileage']}")
+    parts.append(f"🏙️ {listing['location']}")
 
     # Category emoji
     cat = listing.get("category", "")
     if cat == "free":
-        parts.append("\U0001f193 FREE")
+        if not is_free:
+            parts.append("🆓 FREE SECTION")
     elif cat == "cars":
-        parts.append("\U0001f697 CARS")
+        parts.append("🚗 CARS")
     elif cat == "boats":
-        parts.append("\U0001f6a4 BOATS")
+        parts.append("🚤 BOATS")
 
     # Time since posted
     if listing.get("time"):
         age_seconds = (datetime.now(timezone.utc) - listing["time"]).total_seconds()
         mins = max(0, int(age_seconds / 60))
         if mins < 1:
-            parts.append("\u23f0 Just now")
+            parts.append("⏰ Just now")
         else:
-            parts.append(f"\u23f0 {mins}m ago")
+            parts.append(f"⏰ {mins}m ago")
     else:
-        parts.append("\u23f0 NEW")
+        parts.append("⏰ NEW")
 
     safe_title = re.sub(r'[*_`\[\]]', '', str(listing.get("title", "")))[:80].upper()
-    caption = f"\U0001f514 *{listing['source']}* | {safe_title}\n{' \u2022 '.join(parts)}"
-    kb = [[InlineKeyboardButton(text="\U0001f517 VIEW LISTING", url=listing["link"])]]
+    
+    # Special formatting for FREE items
+    if is_free:
+        caption = f"🔔🆓 *{listing['source']} FREE ITEM* | {safe_title}\n{' • '.join(parts)}"
+    else:
+        caption = f"🔔 *{listing['source']}* | {safe_title}\n{' • '.join(parts)}"
+    
+    kb = [[InlineKeyboardButton(text="🔗 VIEW LISTING", url=listing["link"])]]
 
     img = listing.get("image", "")
     if img:
@@ -152,6 +278,7 @@ async def send_alert(bot, session, listing):
                             caption=caption, parse_mode="Markdown",
                             reply_markup=InlineKeyboardMarkup(kb)
                         )
+                        log.info(f"✅ SENT: {listing['source']} - {safe_title[:30]}... ({'FREE' if is_free else listing.get('price', 'N/A')})")
                         return True
             else:
                 await bot.send_photo(
@@ -159,6 +286,7 @@ async def send_alert(bot, session, listing):
                     caption=caption, parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup(kb)
                 )
+                log.info(f"✅ SENT: {listing['source']} - {safe_title[:30]}... ({'FREE' if is_free else listing.get('price', 'N/A')})")
                 return True
         except Exception as e:
             log.debug(f"Image send failed, falling back to text: {e}")
@@ -169,24 +297,38 @@ async def send_alert(bot, session, listing):
             reply_markup=InlineKeyboardMarkup(kb),
             disable_web_page_preview=True
         )
+        log.info(f"✅ SENT (text): {listing['source']} - {safe_title[:30]}... ({'FREE' if is_free else listing.get('price', 'N/A')})")
         return True
     except Exception as e:
-        log.error(f"Alert send FAILED: {e}")
+        log.error(f"❌ Alert send FAILED: {e}")
         return False
 
 
 # ─── ALERT QUEUE (real-time sending) ───
 alert_queue = asyncio.Queue()
+free_alert_queue = asyncio.Queue()  # Priority queue for FREE items
 
 async def alert_sender(bot, session, counter):
-    """Drains the alert queue and sends each listing. Robust error handling."""
+    """Drains the alert queues and sends each listing. FREE items first."""
     while True:
         listing = None
         try:
-            listing = await alert_queue.get()
+            # Prioritize FREE items
+            if not free_alert_queue.empty():
+                listing = await free_alert_queue.get()
+            else:
+                try:
+                    listing = await asyncio.wait_for(alert_queue.get(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    # Check if we should exit
+                    if alert_queue.empty() and free_alert_queue.empty():
+                        await asyncio.sleep(0.1)
+                        continue
+                    continue
+            
             if listing is None:  # poison pill = scan done
                 break
-            if listing["id"] in seen:
+            if is_seen(listing["id"]):
                 continue
 
             # ─── AGE FILTER: if timestamp available, skip old listings ───
@@ -202,6 +344,8 @@ async def alert_sender(bot, session, counter):
 
             if await send_alert(bot, session, listing):
                 counter["sent"] += 1
+                if is_free_item(listing.get("price", ""), listing.get("title", "")):
+                    counter["free"] += 1
                 mark_seen(listing["id"])
 
             await asyncio.sleep(0.03)
@@ -213,27 +357,38 @@ async def alert_sender(bot, session, counter):
                 try:
                     alert_queue.task_done()
                 except ValueError:
-                    pass  # already done
+                    pass
+
+
+async def queue_listing(listing):
+    """Queue listing, prioritizing FREE items."""
+    is_free = is_free_item(listing.get("price", ""), listing.get("title", ""))
+    if is_free or listing.get("category") == "free":
+        await free_alert_queue.put(listing)
+    else:
+        await alert_queue.put(listing)
 
 
 # ─── CRAIGSLIST SCANNER ───
 async def scan_craigslist_stream(session):
     """
     Scan all CL cities. Uses ?sort=date so newest listings come first.
-    Craigslist static results do NOT include timestamps, so we only take
-    the first 15 per category (newest by sort order). Dedup via seen IDs
-    ensures we only alert genuinely new listings.
     """
     categories = [
-        ("free", "zip"),
+        ("free", "zip"),   # FREE section - highest priority
         ("cars", "cta"),
         ("boats", "boo"),
     ]
+    
+    total_found = 0
+    total_new = 0
+    
     for city, slug in CL_CITIES.items():
         for cat_name, cat_code in categories:
             try:
-                # sort=date ensures newest listings first
                 url = f"https://{slug}.craigslist.org/search/{cat_code}?sort=date"
+                log.debug(f"Scanning CL {city}/{cat_name}: {url}")
+                
                 async with session.get(
                     url, headers={"User-Agent": UA},
                     timeout=aiohttp.ClientTimeout(total=8)
@@ -245,6 +400,7 @@ async def scan_craigslist_stream(session):
                     soup = BeautifulSoup(html, "html.parser")
 
                     results = soup.select(".cl-static-search-result")[:15]
+                    total_found += len(results)
 
                     for r in results:
                         link_tag = r.select_one("a")
@@ -254,24 +410,23 @@ async def scan_craigslist_stream(session):
                         if not href:
                             continue
 
-                        # Extract listing ID from URL
                         id_match = re.search(r'/(\d+)\.html', href)
                         lid = f"cl_{id_match.group(1)}" if id_match else f"cl_{hash(href)}"
 
-                        if lid in seen:
+                        if is_seen(lid):
                             continue
 
                         title_el = r.select_one(".title")
                         title = title_el.get_text(strip=True) if title_el else "Item"
 
                         price_el = r.select_one(".price")
-                        price = price_el.get_text(strip=True) if price_el else "FREE"
+                        raw_price = price_el.get_text(strip=True) if price_el else ""
+                        price = format_price(raw_price, title)
 
                         mileage = get_mileage(title) if cat_name in ["cars", "boats"] else ""
 
-                        # CL static results have no <time> element — timestamp is None
-                        # Dedup handles "newness"; sort=date ensures top = newest
-                        await alert_queue.put({
+                        total_new += 1
+                        await queue_listing({
                             "id": lid, "source": "CL", "title": title, "link": href,
                             "price": price, "location": city, "category": cat_name,
                             "mileage": mileage, "time": None, "image": ""
@@ -280,21 +435,25 @@ async def scan_craigslist_stream(session):
             except Exception as e:
                 log.warning(f"CL error {city}/{cat_name}: {e}")
             await asyncio.sleep(0.15)
+    
+    log.info(f"CL scan complete: {total_found} found, {total_new} new")
 
 
 # ─── OFFERUP SCANNER ───
 async def scan_offerup_stream(session):
     """
     Scan all OU locations via __NEXT_DATA__ JSON.
-    OfferUp search tiles use 'looseTiles' with 'listing' sub-objects.
-    Listing keys: listingId, title, price, image{url}, locationName.
-    No createdDate in search results — dedup handles newness.
     """
     categories = [
-        ("free", "price_max=0", ""),
+        ("free", "price_max=0", ""),        # FREE items - highest priority
         ("cars", "CATEGORY_ID=5", ""),
         ("boats", "CATEGORY_ID=5", "boat"),
     ]
+    
+    total_found = 0
+    total_new = 0
+    proxy_failures = 0
+    
     for loc, (lat, lon, zipcode) in OU_LOCS.items():
         for cat_name, cat_param, query in categories:
             try:
@@ -303,17 +462,23 @@ async def scan_offerup_stream(session):
                 else:
                     url = f"https://offerup.com/search?q=&lat={lat}&lon={lon}&radius=50&{cat_param}"
 
+                log.debug(f"Scanning OU {loc}/{cat_name}")
+                
+                proxy = get_proxy()
+                proxy_kwargs = {"proxy": proxy} if proxy else {}
+                
                 async with session.get(
                     url, headers={"User-Agent": UA},
-                    proxy=get_proxy(),
+                    **proxy_kwargs,
                     timeout=aiohttp.ClientTimeout(total=12)
                 ) as resp:
                     if resp.status != 200:
                         log.debug(f"OU {loc}/{cat_name} HTTP {resp.status}")
+                        if resp.status in [403, 407, 429]:
+                            proxy_failures += 1
                         continue
                     html = await resp.text()
 
-                    # Extract __NEXT_DATA__ JSON
                     match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
                     if not match:
                         log.debug(f"OU {loc}/{cat_name}: no __NEXT_DATA__")
@@ -321,7 +486,6 @@ async def scan_offerup_stream(session):
 
                     data = json.loads(match.group(1))
 
-                    # Navigate to tiles — path: props.pageProps.searchFeedResponse.looseTiles
                     tiles = (data.get("props", {})
                                  .get("pageProps", {})
                                  .get("searchFeedResponse", {})
@@ -346,10 +510,11 @@ async def scan_offerup_stream(session):
                             continue
 
                         lid = f"ou_{lid_raw}"
-                        if lid in seen:
+                        if is_seen(lid):
                             continue
 
-                        # Image — nested dict with 'url' key
+                        total_found += 1
+
                         img = listing.get("image", {})
                         if isinstance(img, dict):
                             img_url = img.get("url", "")
@@ -358,17 +523,15 @@ async def scan_offerup_stream(session):
                         else:
                             img_url = ""
 
-                        # Price
                         raw_price = listing.get("price", 0)
                         try:
                             price_val = float(raw_price)
-                            price_str = "FREE" if price_val == 0 else f"${int(price_val)}"
+                            price_str = format_price(f"${int(price_val)}" if price_val > 0 else "FREE", title)
                         except (ValueError, TypeError):
-                            price_str = "FREE"
+                            price_str = format_price("", title)
 
                         mileage = ""
                         if cat_name in ["cars", "boats"]:
-                            # vehicleMiles is available in some listings
                             vm = listing.get("vehicleMiles")
                             if vm:
                                 mileage = f"{vm} mi"
@@ -377,7 +540,8 @@ async def scan_offerup_stream(session):
 
                         loc_name = listing.get("locationName", loc)
 
-                        await alert_queue.put({
+                        total_new += 1
+                        await queue_listing({
                             "id": lid, "source": "OU", "title": title,
                             "link": f"https://offerup.com/item/detail/{lid_raw}",
                             "price": price_str, "location": f"{loc_name} ({zipcode})",
@@ -391,20 +555,29 @@ async def scan_offerup_stream(session):
             except Exception as e:
                 log.warning(f"OU error {loc}/{cat_name}: {e}")
             await asyncio.sleep(0.15)
+    
+    if proxy_failures > 5:
+        log.warning(f"⚠️ High proxy failure rate: {proxy_failures} failures. Proxies may need updating.")
+    log.info(f"OU scan complete: {total_found} found, {total_new} new")
 
 
 # ─── DO SCAN ───
 async def do_scan(bot):
     """
     Main scan — runs CL and OU in PARALLEL, sends alerts in REAL TIME.
-    MAX_AGE_MINUTES filter applies when timestamps are available.
-    For listings without timestamps (most), dedup via seen IDs prevents repeats.
+    FREE items are prioritized.
     """
-    log.info(f"Scan start — now(UTC)={datetime.now(timezone.utc).strftime('%H:%M:%S')}")
+    log.info(f"{'='*50}")
+    log.info(f"SCAN START — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    log.info(f"Active seen IDs: {len(seen)} (expire after {SEEN_EXPIRY_HOURS}h)")
+    log.info(f"{'='*50}")
 
-    counter = {"sent": 0}
+    counter = {"sent": 0, "free": 0}
     connector = aiohttp.TCPConnector(force_close=True, limit=20)
     async with aiohttp.ClientSession(connector=connector) as session:
+        # Fetch fresh free proxies before scanning
+        await fetch_free_proxies(session)
+        log.info(f"Using {len(FREE_PROXIES)} free proxies for OfferUp")
 
         consumer_task = asyncio.create_task(alert_sender(bot, session, counter))
 
@@ -413,11 +586,21 @@ async def do_scan(bot):
             scan_offerup_stream(session),
         )
 
-        await alert_queue.join()
+        # Wait for queues to drain
+        while not alert_queue.empty() or not free_alert_queue.empty():
+            await asyncio.sleep(0.1)
+        
+        await asyncio.sleep(0.5)  # Final drain
         await alert_queue.put(None)  # poison pill
         await consumer_task
 
-        log.info(f"Scan complete — sent {counter['sent']} new alerts")
+        log.info(f"{'='*50}")
+        log.info(f"SCAN COMPLETE — Sent {counter['sent']} alerts ({counter['free']} FREE items)")
+        log.info(f"{'='*50}")
+        
+        # Save seen IDs
+        save_seen()
+        
         return counter["sent"]
 
 
@@ -426,16 +609,17 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global scan_running
 
     if scan_running:
-        await update.message.reply_text("\u23f3 Scan already running...")
+        await update.message.reply_text("⏳ Scan already running...")
         return
 
     scan_running = True
 
     msg = await update.message.reply_text(
-        "\U0001f50d *SCANNING...*\n\n"
-        f"\U0001f4cb {len(CL_CITIES)} CL cities\n"
-        f"\U0001f7e0 {len(OU_LOCS)} OU locations\n"
-        "\U0001f4e6 FREE \u2022 CARS \u2022 BOATS",
+        "🔍 *SCANNING...*\n\n"
+        f"📋 {len(CL_CITIES)} CL cities\n"
+        f"🟠 {len(OU_LOCS)} OU locations\n"
+        "📦 FREE • CARS • BOATS\n\n"
+        f"🆓 FREE items prioritized!",
         parse_mode="Markdown"
     )
 
@@ -451,9 +635,10 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elapsed = int((datetime.now(timezone.utc) - start).total_seconds())
 
     await msg.edit_text(
-        f"\u2705 *SCAN COMPLETE*\n\n"
-        f"\U0001f4e4 Sent: {total} alerts\n"
-        f"\u23f1\ufe0f Time: {elapsed}s",
+        f"✅ *SCAN COMPLETE*\n\n"
+        f"📤 Sent: {total} alerts\n"
+        f"⏱️ Time: {elapsed}s\n"
+        f"📂 Tracking: {len(seen)} IDs",
         parse_mode="Markdown"
     )
 
@@ -461,12 +646,14 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── /start COMMAND ───
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "\U0001f916 *LISTING SCANNER*\n\n"
+        "🤖 *LISTING SCANNER v2.0*\n\n"
         "/scan - Scan now\n"
         "/status - Status\n"
-        "/clear - Clear seen IDs (fresh start)\n\n"
-        f"\U0001f504 Auto-scan: every {SCAN_INTERVAL}s\n"
-        "\U0001f501 Dedup via seen IDs",
+        "/clear - Clear seen IDs\n"
+        "/stats - View statistics\n\n"
+        f"🔄 Auto-scan: every {SCAN_INTERVAL}s\n"
+        f"⏰ ID expiry: {SEEN_EXPIRY_HOURS}h\n"
+        "🆓 FREE items prioritized!",
         parse_mode="Markdown"
     )
 
@@ -474,10 +661,28 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── /status COMMAND ───
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"\U0001f4ca *STATUS*\n\n"
-        f"\u2705 Running\n"
-        f"\U0001f4c2 Seen: {len(seen)}\n"
-        f"\U0001f504 Interval: {SCAN_INTERVAL}s",
+        f"📊 *STATUS*\n\n"
+        f"✅ Running\n"
+        f"📂 Seen IDs: {len(seen)}\n"
+        f"🔄 Interval: {SCAN_INTERVAL}s\n"
+        f"⏰ ID Expiry: {SEEN_EXPIRY_HOURS}h\n"
+        f"🆓 FREE priority: {'ON' if PRIORITY_FREE else 'OFF'}",
+        parse_mode="Markdown"
+    )
+
+
+# ─── /stats COMMAND ───
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Count recent seen IDs by source
+    cl_count = sum(1 for lid in seen if lid.startswith("cl_"))
+    ou_count = sum(1 for lid in seen if lid.startswith("ou_"))
+    
+    await update.message.reply_text(
+        f"📈 *STATISTICS*\n\n"
+        f"📂 Total tracked: {len(seen)}\n"
+        f"🔵 Craigslist: {cl_count}\n"
+        f"🟠 OfferUp: {ou_count}\n"
+        f"⏰ Expiry: {SEEN_EXPIRY_HOURS}h",
         parse_mode="Markdown"
     )
 
@@ -486,11 +691,10 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global seen
     old_count = len(seen)
-    seen = set()
-    with open(DB_FILE, "w") as f:
-        f.write("")
+    seen = {}
+    save_seen()
     await update.message.reply_text(
-        f"\U0001f9f9 Cleared {old_count} seen IDs.\n"
+        f"🧹 Cleared {old_count} seen IDs.\n"
         "Next scan will treat everything as new.",
         parse_mode="Markdown"
     )
@@ -498,17 +702,17 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── AUTO SCANNER ───
 async def auto_scanner(bot):
-    log.info(f"Auto-scanner: every {SCAN_INTERVAL}s, dedup via seen_ids")
+    log.info(f"Auto-scanner started: every {SCAN_INTERVAL}s, IDs expire after {SEEN_EXPIRY_HOURS}h")
 
     while not shutdown_event.is_set():
         if not scan_running:
             start = datetime.now(timezone.utc)
-            log.info(f"Auto-scan at {start.strftime('%H:%M:%S')} UTC")
+            log.info(f"Auto-scan triggered at {start.strftime('%H:%M:%S')} UTC")
 
             try:
                 total = await do_scan(bot)
                 elapsed = int((datetime.now(timezone.utc) - start).total_seconds())
-                log.info(f"Sent {total} alerts in {elapsed}s")
+                log.info(f"Auto-scan complete: {total} alerts in {elapsed}s")
             except Exception as e:
                 log.error(f"Auto-scan failed: {e}", exc_info=True)
 
@@ -528,7 +732,11 @@ shutdown_event = asyncio.Event()
 async def health(request):
     if shutdown_event.is_set():
         return web.Response(text="SHUTTING DOWN", status=503)
-    return web.Response(text="OK")
+    return web.Response(text=json.dumps({
+        "status": "OK",
+        "seen_ids": len(seen),
+        "scan_running": scan_running
+    }), content_type="application/json")
 
 # ─── GRACEFUL SHUTDOWN ───
 def handle_signal(sig):
@@ -556,6 +764,7 @@ async def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("scan", scan_command))
     app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("clear", clear_command))
 
     await app.initialize()
@@ -567,10 +776,12 @@ async def main():
 
     await app.bot.send_message(
         CHAT_ID,
-        f"\U0001f680 *BOT STARTED*\n\n"
-        f"\U0001f504 Scanning every {SCAN_INTERVAL}s\n"
-        f"\U0001f4e6 FREE \u2022 CARS \u2022 BOATS\n"
-        f"\U0001f501 Dedup via seen IDs ({len(seen)} tracked)",
+        f"🚀 *BOT STARTED v2.0*\n\n"
+        f"🔄 Scanning every {SCAN_INTERVAL}s\n"
+        f"📦 FREE • CARS • BOATS\n"
+        f"🆓 FREE items prioritized!\n"
+        f"⏰ IDs expire after {SEEN_EXPIRY_HOURS}h\n"
+        f"📂 Tracking {len(seen)} IDs",
         parse_mode="Markdown"
     )
 
@@ -596,6 +807,8 @@ async def main():
     log.info("Stopping health server...")
     await runner.cleanup()
 
+    # Final save
+    save_seen()
     log.info("Clean exit.")
 
 if __name__ == "__main__":
