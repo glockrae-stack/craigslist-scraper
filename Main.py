@@ -62,10 +62,13 @@ OU_LOCS = {
 
 # ─── SEEN IDs ───
 seen = set()
+first_boot = True  # True = no prior seen_ids file existed → seed silently
 if os.path.exists(DB_FILE):
     with open(DB_FILE) as f:
         seen = set(line.strip() for line in f if line.strip())
-print(f"📂 Loaded {len(seen)} seen IDs")
+    if seen:
+        first_boot = False
+print(f"📂 Loaded {len(seen)} seen IDs (first_boot={first_boot})")
 
 def mark_seen(lid):
     seen.add(lid)
@@ -166,6 +169,7 @@ alert_queue = asyncio.Queue()
 
 async def alert_sender(bot, session, counter):
     """Drains the alert queue and sends each listing immediately as it arrives."""
+    now = datetime.utcnow()
     while True:
         listing = await alert_queue.get()
         if listing is None:  # poison pill = scan done
@@ -173,6 +177,13 @@ async def alert_sender(bot, session, counter):
         if listing["id"] in seen:
             alert_queue.task_done()
             continue
+        # ─── AGE FILTER: only alert on listings within MAX_AGE_MINUTES ───
+        if listing.get("time"):
+            age_minutes = (now - listing["time"]).total_seconds() / 60
+            if age_minutes > MAX_AGE_MINUTES:
+                mark_seen(listing["id"])  # still mark seen so we don't re-check next scan
+                alert_queue.task_done()
+                continue
         # Fetch CL image just-in-time
         if listing["source"] == "CL" and not listing["image"]:
             listing["image"] = await fetch_cl_image(session, listing["link"])
@@ -308,24 +319,44 @@ async def scan_offerup_stream(session):
                 log.warning(f"OU error {loc}/{cat_name}: {e}")
             await asyncio.sleep(0.15)
 
+# ─── SEED CONSUMER (first boot — record IDs without sending alerts) ───
+async def seed_consumer(counter):
+    """On first boot, drain the queue and just mark IDs as seen. No alerts sent."""
+    while True:
+        listing = await alert_queue.get()
+        if listing is None:
+            break
+        if listing["id"] not in seen:
+            mark_seen(listing["id"])
+            counter["seeded"] += 1
+        alert_queue.task_done()
+
 # ─── DO SCAN ───
 async def do_scan(bot):
     """
     Main scan — runs CL and OU in PARALLEL, sends alerts in REAL TIME:
-    1. Start alert_sender (drains queue, sends immediately)
-    2. Run scan_craigslist_stream + scan_offerup_stream concurrently via gather()
-    3. Each scanner pushes listings to the shared queue as they're found
-    4. Alerts go out within seconds of discovery, not after the full scan
+    1. On FIRST BOOT: silently seeds seen_ids (no alerts) to prevent flood
+    2. Start alert_sender (drains queue, sends immediately)
+    3. Run scan_craigslist_stream + scan_offerup_stream concurrently via gather()
+    4. Each scanner pushes listings to the shared queue as they're found
+    5. Alerts go out within seconds of discovery, not after the full scan
+    6. Listings older than MAX_AGE_MINUTES are silently skipped
     """
+    global first_boot
     now = datetime.utcnow()
-    log.info(f"Scan start — now(UTC)={now.strftime('%H:%M:%S')}")
+    log.info(f"Scan start — now(UTC)={now.strftime('%H:%M:%S')} first_boot={first_boot}")
     
-    counter = {"sent": 0}
+    counter = {"sent": 0, "seeded": 0}
     connector = aiohttp.TCPConnector(force_close=True, limit=20)
     async with aiohttp.ClientSession(connector=connector) as session:
         
-        # Start the alert sender (consumes queue in real time)
-        sender_task = asyncio.create_task(alert_sender(bot, session, counter))
+        if first_boot:
+            # First boot: just record all current listings so we don't spam
+            log.info("🌱 First boot — seeding seen IDs (no alerts)")
+            consumer_task = asyncio.create_task(seed_consumer(counter))
+        else:
+            # Normal operation: send alerts in real time
+            consumer_task = asyncio.create_task(alert_sender(bot, session, counter))
         
         # Run BOTH scanners simultaneously
         await asyncio.gather(
@@ -333,12 +364,17 @@ async def do_scan(bot):
             scan_offerup_stream(session),
         )
         
-        # Both scanners done — drain remaining items then stop sender
+        # Both scanners done — drain remaining items then stop consumer
         await alert_queue.join()       # wait for queue to empty
         await alert_queue.put(None)    # poison pill
-        await sender_task              # wait for sender to exit
+        await consumer_task            # wait for consumer to exit
         
-        log.info(f"Found & sent {counter['sent']} new alerts")
+        if first_boot:
+            log.info(f"🌱 Seeded {counter['seeded']} IDs — next scan will send real alerts")
+            first_boot = False
+        else:
+            log.info(f"Found & sent {counter['sent']} new alerts")
+        
         return counter["sent"]
 
 # ─── /scan COMMAND ───
