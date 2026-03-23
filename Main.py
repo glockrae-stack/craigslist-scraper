@@ -29,10 +29,6 @@ MAX_AGE_MINUTES = 40       # Only alert listings within 40 minutes (when timesta
 SCAN_INTERVAL = 30         # Scan every 30 seconds
 SEEN_EXPIRY_HOURS = 6      # Expire seen IDs after 6 hours (allows re-alerting old listings)
 
-# ─── FREE ITEM SETTINGS ───
-FREE_KEYWORDS = ["free", "curb", "curbside", "giveaway", "giving away", "must go", "pick up only", "free stuff"]
-PRIORITY_FREE = True       # Prioritize FREE items in alerts
-
 # ─── FREE PROXY LIST ───
 # Using free public proxies - refreshed from free proxy APIs
 FREE_PROXIES = []
@@ -166,36 +162,6 @@ load_seen()
 scan_running = False
 
 # ─── HELPERS ───
-def is_free_item(price_str, title=""):
-    """Enhanced FREE item detection."""
-    if not price_str:
-        return False
-    price_lower = price_str.lower().strip()
-    title_lower = title.lower() if title else ""
-    
-    # Direct price checks
-    if price_lower in ["free", "$0", "0", "$0.00", "0.00"]:
-        return True
-    
-    # Keyword checks in title
-    for keyword in FREE_KEYWORDS:
-        if keyword in title_lower:
-            return True
-    
-    # Check for $0 variants
-    if re.match(r'^\$?0(\.0+)?$', price_lower):
-        return True
-    
-    return False
-
-def format_price(price_str, title=""):
-    """Format price with better FREE detection."""
-    if is_free_item(price_str, title):
-        return "FREE"
-    if not price_str or price_str.strip() == "":
-        return "FREE"
-    return price_str
-
 async def fetch_cl_image(session, url):
     """Fetch og:image from a Craigslist listing page."""
     try:
@@ -224,14 +190,8 @@ def get_mileage(text):
 async def send_alert(bot, session, listing):
     """Send a single Telegram alert with image."""
     parts = []
-    
-    is_free = is_free_item(listing.get("price", ""), listing.get("title", ""))
-    
-    if is_free:
-        parts.append("🆓 FREE")
-    elif listing.get("price") and listing["price"] not in ["FREE", "$0", ""]:
+    if listing.get("price") and listing["price"] not in ["FREE", "$0", ""]:
         parts.append(f"💰 {listing['price']}")
-    
     if listing.get("mileage"):
         parts.append(f"🛣️ {listing['mileage']}")
     parts.append(f"🏙️ {listing['location']}")
@@ -239,8 +199,7 @@ async def send_alert(bot, session, listing):
     # Category emoji
     cat = listing.get("category", "")
     if cat == "free":
-        if not is_free:
-            parts.append("🆓 FREE SECTION")
+        parts.append("🆓 FREE")
     elif cat == "cars":
         parts.append("🚗 CARS")
     elif cat == "boats":
@@ -258,13 +217,7 @@ async def send_alert(bot, session, listing):
         parts.append("⏰ NEW")
 
     safe_title = re.sub(r'[*_`\[\]]', '', str(listing.get("title", "")))[:80].upper()
-    
-    # Special formatting for FREE items
-    if is_free:
-        caption = f"🔔🆓 *{listing['source']} FREE ITEM* | {safe_title}\n{' • '.join(parts)}"
-    else:
-        caption = f"🔔 *{listing['source']}* | {safe_title}\n{' • '.join(parts)}"
-    
+    caption = f"🔔 *{listing['source']}* | {safe_title}\n{' • '.join(parts)}"
     kb = [[InlineKeyboardButton(text="🔗 VIEW LISTING", url=listing["link"])]]
 
     img = listing.get("image", "")
@@ -306,25 +259,13 @@ async def send_alert(bot, session, listing):
 
 # ─── ALERT QUEUE (real-time sending) ───
 alert_queue = asyncio.Queue()
-free_alert_queue = asyncio.Queue()  # Priority queue for FREE items
 
 async def alert_sender(bot, session, counter):
-    """Drains the alert queues and sends each listing. FREE items first."""
+    """Drains the alert queue and sends each listing."""
     while True:
         listing = None
         try:
-            # Prioritize FREE items
-            if not free_alert_queue.empty():
-                listing = await free_alert_queue.get()
-            else:
-                try:
-                    listing = await asyncio.wait_for(alert_queue.get(), timeout=0.1)
-                except asyncio.TimeoutError:
-                    # Check if we should exit
-                    if alert_queue.empty() and free_alert_queue.empty():
-                        await asyncio.sleep(0.1)
-                        continue
-                    continue
+            listing = await alert_queue.get()
             
             if listing is None:  # poison pill = scan done
                 break
@@ -344,8 +285,6 @@ async def alert_sender(bot, session, counter):
 
             if await send_alert(bot, session, listing):
                 counter["sent"] += 1
-                if is_free_item(listing.get("price", ""), listing.get("title", "")):
-                    counter["free"] += 1
                 mark_seen(listing["id"])
 
             await asyncio.sleep(0.03)
@@ -358,15 +297,6 @@ async def alert_sender(bot, session, counter):
                     alert_queue.task_done()
                 except ValueError:
                     pass
-
-
-async def queue_listing(listing):
-    """Queue listing, prioritizing FREE items."""
-    is_free = is_free_item(listing.get("price", ""), listing.get("title", ""))
-    if is_free or listing.get("category") == "free":
-        await free_alert_queue.put(listing)
-    else:
-        await alert_queue.put(listing)
 
 
 # ─── CRAIGSLIST SCANNER ───
@@ -420,13 +350,12 @@ async def scan_craigslist_stream(session):
                         title = title_el.get_text(strip=True) if title_el else "Item"
 
                         price_el = r.select_one(".price")
-                        raw_price = price_el.get_text(strip=True) if price_el else ""
-                        price = format_price(raw_price, title)
+                        price = price_el.get_text(strip=True) if price_el else "FREE"
 
                         mileage = get_mileage(title) if cat_name in ["cars", "boats"] else ""
 
                         total_new += 1
-                        await queue_listing({
+                        await alert_queue.put({
                             "id": lid, "source": "CL", "title": title, "link": href,
                             "price": price, "location": city, "category": cat_name,
                             "mileage": mileage, "time": None, "image": ""
@@ -526,9 +455,9 @@ async def scan_offerup_stream(session):
                         raw_price = listing.get("price", 0)
                         try:
                             price_val = float(raw_price)
-                            price_str = format_price(f"${int(price_val)}" if price_val > 0 else "FREE", title)
+                            price_str = "FREE" if price_val == 0 else f"${int(price_val)}"
                         except (ValueError, TypeError):
-                            price_str = format_price("", title)
+                            price_str = "FREE"
 
                         mileage = ""
                         if cat_name in ["cars", "boats"]:
@@ -541,7 +470,7 @@ async def scan_offerup_stream(session):
                         loc_name = listing.get("locationName", loc)
 
                         total_new += 1
-                        await queue_listing({
+                        await alert_queue.put({
                             "id": lid, "source": "OU", "title": title,
                             "link": f"https://offerup.com/item/detail/{lid_raw}",
                             "price": price_str, "location": f"{loc_name} ({zipcode})",
@@ -565,14 +494,13 @@ async def scan_offerup_stream(session):
 async def do_scan(bot):
     """
     Main scan — runs CL and OU in PARALLEL, sends alerts in REAL TIME.
-    FREE items are prioritized.
     """
     log.info(f"{'='*50}")
     log.info(f"SCAN START — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
     log.info(f"Active seen IDs: {len(seen)} (expire after {SEEN_EXPIRY_HOURS}h)")
     log.info(f"{'='*50}")
 
-    counter = {"sent": 0, "free": 0}
+    counter = {"sent": 0}
     connector = aiohttp.TCPConnector(force_close=True, limit=20)
     async with aiohttp.ClientSession(connector=connector) as session:
         # Fetch fresh free proxies before scanning
@@ -586,16 +514,13 @@ async def do_scan(bot):
             scan_offerup_stream(session),
         )
 
-        # Wait for queues to drain
-        while not alert_queue.empty() or not free_alert_queue.empty():
-            await asyncio.sleep(0.1)
-        
-        await asyncio.sleep(0.5)  # Final drain
+        # Wait for queue to drain
+        await alert_queue.join()
         await alert_queue.put(None)  # poison pill
         await consumer_task
 
         log.info(f"{'='*50}")
-        log.info(f"SCAN COMPLETE — Sent {counter['sent']} alerts ({counter['free']} FREE items)")
+        log.info(f"SCAN COMPLETE — Sent {counter['sent']} alerts")
         log.info(f"{'='*50}")
         
         # Save seen IDs
@@ -646,14 +571,13 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── /start COMMAND ───
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 *LISTING SCANNER v2.0*\n\n"
+        "🤖 *LISTING SCANNER*\n\n"
         "/scan - Scan now\n"
         "/status - Status\n"
         "/clear - Clear seen IDs\n"
         "/stats - View statistics\n\n"
         f"🔄 Auto-scan: every {SCAN_INTERVAL}s\n"
-        f"⏰ ID expiry: {SEEN_EXPIRY_HOURS}h\n"
-        "🆓 FREE items prioritized!",
+        f"⏰ ID expiry: {SEEN_EXPIRY_HOURS}h",
         parse_mode="Markdown"
     )
 
@@ -665,8 +589,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Running\n"
         f"📂 Seen IDs: {len(seen)}\n"
         f"🔄 Interval: {SCAN_INTERVAL}s\n"
-        f"⏰ ID Expiry: {SEEN_EXPIRY_HOURS}h\n"
-        f"🆓 FREE priority: {'ON' if PRIORITY_FREE else 'OFF'}",
+        f"⏰ ID Expiry: {SEEN_EXPIRY_HOURS}h",
         parse_mode="Markdown"
     )
 
@@ -776,10 +699,9 @@ async def main():
 
     await app.bot.send_message(
         CHAT_ID,
-        f"🚀 *BOT STARTED v2.0*\n\n"
+        f"🚀 *BOT STARTED*\n\n"
         f"🔄 Scanning every {SCAN_INTERVAL}s\n"
         f"📦 FREE • CARS • BOATS\n"
-        f"🆓 FREE items prioritized!\n"
         f"⏰ IDs expire after {SEEN_EXPIRY_HOURS}h\n"
         f"📂 Tracking {len(seen)} IDs",
         parse_mode="Markdown"
