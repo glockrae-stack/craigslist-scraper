@@ -30,7 +30,11 @@ SCAN_INTERVAL = 30         # Scan every 30 seconds
 SEEN_EXPIRY_HOURS = 6      # Expire seen IDs after 6 hours (allows re-alerting old listings)
 PARALLEL_WORKERS = 10      # Number of parallel scan workers
 
-# ─── PROXY LIST ───
+# ─── PROXY CONFIGURATION ───
+# For OfferUp - try without proxy first (faster), use proxy as fallback
+USE_PROXY_FOR_OFFERUP = True  # Set to False to skip proxies entirely
+PROXY_RETRY_WITHOUT = True     # Retry without proxy if proxy fails
+
 # Hardcoded reliable proxies + dynamic fetch as backup
 PROXY_LIST = [
     "http://23.88.88.105:80",
@@ -43,17 +47,13 @@ PROXY_LIST = [
     "http://65.108.203.37:18080",
     "http://129.150.39.242:8118",
     "http://97.74.87.226:80",
-    "http://104.168.158.236:10818",
     "http://167.71.60.190:8080",
     "http://35.225.22.61:80",
     "http://51.141.175.118:80",
     "http://47.89.184.18:3129",
-    "http://4.213.167.178:80",
     "http://150.136.153.231:80",
     "http://74.176.195.135:80",
     "http://142.93.202.130:3129",
-    "http://34.44.49.215:80",
-    "http://143.42.66.91:80",
     "http://172.183.241.1:8080",
     "http://20.205.61.143:80",
     "http://52.226.125.228:8080",
@@ -71,6 +71,8 @@ failed_proxies = set()
 
 def get_proxy():
     """Get a random working proxy with rotation."""
+    if not USE_PROXY_FOR_OFFERUP:
+        return None
     if working_proxies:
         return random.choice(working_proxies)
     # Reset if all failed
@@ -81,13 +83,13 @@ def get_proxy():
 
 def mark_proxy_failed(proxy):
     """Mark a proxy as failed."""
-    if proxy in working_proxies:
+    if proxy and proxy in working_proxies:
         working_proxies.remove(proxy)
         failed_proxies.add(proxy)
 
 def mark_proxy_success(proxy):
     """Mark a proxy as working."""
-    if proxy in failed_proxies:
+    if proxy and proxy in failed_proxies:
         failed_proxies.remove(proxy)
         if proxy not in working_proxies:
             working_proxies.append(proxy)
@@ -275,6 +277,8 @@ async def send_alert(bot, session, listing):
     kb = [[InlineKeyboardButton(text="🔗 VIEW LISTING", url=listing["link"])]]
 
     img = listing.get("image", "")
+    price_display = listing.get('price', 'N/A')
+    
     if img:
         try:
             if "craigslist" in img:
@@ -285,7 +289,7 @@ async def send_alert(bot, session, listing):
                             caption=caption, parse_mode="Markdown",
                             reply_markup=InlineKeyboardMarkup(kb)
                         )
-                        log.info(f"✅ SENT: {listing['source']} - {safe_title[:30]}... ({'FREE' if is_free else listing.get('price', 'N/A')})")
+                        log.info(f"✅ SENT: {listing['source']} - {safe_title[:30]}... ({price_display})")
                         return True
             else:
                 await bot.send_photo(
@@ -293,7 +297,7 @@ async def send_alert(bot, session, listing):
                     caption=caption, parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup(kb)
                 )
-                log.info(f"✅ SENT: {listing['source']} - {safe_title[:30]}... ({'FREE' if is_free else listing.get('price', 'N/A')})")
+                log.info(f"✅ SENT: {listing['source']} - {safe_title[:30]}... ({price_display})")
                 return True
         except Exception as e:
             log.debug(f"Image send failed, falling back to text: {e}")
@@ -304,7 +308,7 @@ async def send_alert(bot, session, listing):
             reply_markup=InlineKeyboardMarkup(kb),
             disable_web_page_preview=True
         )
-        log.info(f"✅ SENT (text): {listing['source']} - {safe_title[:30]}... ({'FREE' if is_free else listing.get('price', 'N/A')})")
+        log.info(f"✅ SENT (text): {listing['source']} - {safe_title[:30]}... ({price_display})")
         return True
     except Exception as e:
         log.error(f"❌ Alert send FAILED: {e}")
@@ -432,6 +436,27 @@ async def scan_craigslist_parallel(session):
 
 
 # ─── OFFERUP SCANNER (PARALLEL) ───
+async def fetch_offerup_page(session, url, proxy=None):
+    """Fetch OfferUp page with optional proxy, return HTML or None."""
+    try:
+        proxy_kwargs = {"proxy": proxy} if proxy else {}
+        async with session.get(
+            url, headers={"User-Agent": UA},
+            **proxy_kwargs,
+            timeout=aiohttp.ClientTimeout(total=12)
+        ) as resp:
+            if resp.status == 200:
+                if proxy:
+                    mark_proxy_success(proxy)
+                return await resp.text()
+            elif resp.status in [403, 407, 429] and proxy:
+                mark_proxy_failed(proxy)
+    except Exception:
+        if proxy:
+            mark_proxy_failed(proxy)
+    return None
+
+
 async def scan_ou_location(session, loc, lat, lon, zipcode, categories, counter):
     """Scan a single OU location across all categories."""
     for cat_name, cat_param, query in categories:
@@ -441,24 +466,19 @@ async def scan_ou_location(session, loc, lat, lon, zipcode, categories, counter)
             else:
                 url = f"https://offerup.com/search?q=&lat={lat}&lon={lon}&radius=50&{cat_param}"
 
-            proxy = get_proxy()
-            proxy_kwargs = {"proxy": proxy} if proxy else {}
+            html = None
             
-            async with session.get(
-                url, headers={"User-Agent": UA},
-                **proxy_kwargs,
-                timeout=aiohttp.ClientTimeout(total=12)
-            ) as resp:
-                if resp.status != 200:
-                    if resp.status in [403, 407, 429] and proxy:
-                        mark_proxy_failed(proxy)
-                    continue
-                
-                # Proxy worked
-                if proxy:
-                    mark_proxy_success(proxy)
-                    
-                html = await resp.text()
+            # Try with proxy first
+            proxy = get_proxy()
+            if proxy:
+                html = await fetch_offerup_page(session, url, proxy)
+            
+            # Retry without proxy if failed and PROXY_RETRY_WITHOUT is enabled
+            if not html and PROXY_RETRY_WITHOUT:
+                html = await fetch_offerup_page(session, url, None)
+            
+            if not html:
+                continue
 
                 match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
                 if not match:
