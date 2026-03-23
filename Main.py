@@ -62,13 +62,10 @@ OU_LOCS = {
 
 # ─── SEEN IDs ───
 seen = set()
-first_boot = True  # True = no prior seen_ids file existed → seed silently
 if os.path.exists(DB_FILE):
     with open(DB_FILE) as f:
         seen = set(line.strip() for line in f if line.strip())
-    if seen:
-        first_boot = False
-print(f"📂 Loaded {len(seen)} seen IDs (first_boot={first_boot})")
+print(f"📂 Loaded {len(seen)} seen IDs")
 
 def mark_seen(lid):
     seen.add(lid)
@@ -113,35 +110,35 @@ async def send_alert(bot, session, listing):
     """Send single alert with image"""
     parts = []
     if listing.get("price") and listing["price"] not in ["FREE", "$0", ""]:
-        parts.append(f"💰 {listing['price']}")
+        parts.append(f"\U0001f4b0 {listing['price']}")
     if listing.get("mileage"):
-        parts.append(f"🛣️ {listing['mileage']}")
-    parts.append(f"🏙️ {listing['location']}")
-    
+        parts.append(f"\U0001f6e3\ufe0f {listing['mileage']}")
+    parts.append(f"\U0001f3d9\ufe0f {listing['location']}")
+
     # Category emoji
     cat = listing.get("category", "")
     if cat == "free":
-        parts.append("🆓 FREE")
+        parts.append("\U0001f193 FREE")
     elif cat == "cars":
-        parts.append("🚗 CARS")
+        parts.append("\U0001f697 CARS")
     elif cat == "boats":
-        parts.append("🚤 BOATS")
-    
-    # Time since posted (UTC-based)
+        parts.append("\U0001f6a4 BOATS")
+
+    # Time since posted — recalculate fresh each time (not a stale snapshot)
     if listing.get("time"):
         age_seconds = (datetime.utcnow() - listing["time"]).total_seconds()
         mins = int(age_seconds / 60)
         if mins < 0:
             mins = 0  # clock skew guard
         if mins < 1:
-            parts.append("⏰ Just now")
+            parts.append("\u23f0 Just now")
         else:
-            parts.append(f"⏰ {mins}m ago")
-    
+            parts.append(f"\u23f0 {mins}m ago")
+
     safe_title = re.sub(r'[*_`\[\]]', '', str(listing.get("title", "")))[:80].upper()
-    caption = f"🔔 *{listing['source']}* | {safe_title}\n{' • '.join(parts)}"
-    kb = [[InlineKeyboardButton(text="🔗 VIEW LISTING", url=listing["link"])]]
-    
+    caption = f"\U0001f514 *{listing['source']}* | {safe_title}\n{' \u2022 '.join(parts)}"
+    kb = [[InlineKeyboardButton(text="\U0001f517 VIEW LISTING", url=listing["link"])]]
+
     img = listing.get("image", "")
     if img:
         try:
@@ -155,7 +152,7 @@ async def send_alert(bot, session, listing):
                 return True
         except Exception as e:
             log.debug(f"Image send failed, falling back to text: {e}")
-    
+
     try:
         await bot.send_message(chat_id=CHAT_ID, text=caption, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb), disable_web_page_preview=True)
         return True
@@ -169,7 +166,6 @@ alert_queue = asyncio.Queue()
 
 async def alert_sender(bot, session, counter):
     """Drains the alert queue and sends each listing immediately as it arrives."""
-    now = datetime.utcnow()
     while True:
         listing = await alert_queue.get()
         if listing is None:  # poison pill = scan done
@@ -177,11 +173,11 @@ async def alert_sender(bot, session, counter):
         if listing["id"] in seen:
             alert_queue.task_done()
             continue
-        # ─── AGE FILTER: only alert on listings within MAX_AGE_MINUTES ───
+        # ─── AGE FILTER: recalculate now per-listing to avoid stale timestamp ───
         if listing.get("time"):
-            age_minutes = (now - listing["time"]).total_seconds() / 60
+            age_minutes = (datetime.utcnow() - listing["time"]).total_seconds() / 60
             if age_minutes > MAX_AGE_MINUTES:
-                mark_seen(listing["id"])  # still mark seen so we don't re-check next scan
+                mark_seen(listing["id"])  # mark seen so we don't re-check next scan
                 alert_queue.task_done()
                 continue
         # Fetch CL image just-in-time
@@ -193,7 +189,7 @@ async def alert_sender(bot, session, counter):
         alert_queue.task_done()
         await asyncio.sleep(0.03)
 
-# ─── STREAMING SCANNERS (push to queue instead of collecting) ───
+# ─── STREAMING SCANNERS ───
 async def scan_craigslist_stream(session):
     """Scan all CL cities and push new listings to alert_queue in real time."""
     categories = [
@@ -319,140 +315,110 @@ async def scan_offerup_stream(session):
                 log.warning(f"OU error {loc}/{cat_name}: {e}")
             await asyncio.sleep(0.15)
 
-# ─── SEED CONSUMER (first boot — record IDs without sending alerts) ───
-async def seed_consumer(counter):
-    """On first boot, drain the queue and just mark IDs as seen. No alerts sent."""
-    while True:
-        listing = await alert_queue.get()
-        if listing is None:
-            break
-        if listing["id"] not in seen:
-            mark_seen(listing["id"])
-            counter["seeded"] += 1
-        alert_queue.task_done()
-
 # ─── DO SCAN ───
 async def do_scan(bot):
     """
-    Main scan — runs CL and OU in PARALLEL, sends alerts in REAL TIME:
-    1. On FIRST BOOT: silently seeds seen_ids (no alerts) to prevent flood
-    2. Start alert_sender (drains queue, sends immediately)
-    3. Run scan_craigslist_stream + scan_offerup_stream concurrently via gather()
-    4. Each scanner pushes listings to the shared queue as they're found
-    5. Alerts go out within seconds of discovery, not after the full scan
-    6. Listings older than MAX_AGE_MINUTES are silently skipped
+    Main scan — runs CL and OU in PARALLEL, sends alerts in REAL TIME.
+    No first_boot logic — MAX_AGE_MINUTES filter prevents alert floods on deploy.
     """
-    global first_boot
-    now = datetime.utcnow()
-    log.info(f"Scan start — now(UTC)={now.strftime('%H:%M:%S')} first_boot={first_boot}")
-    
-    counter = {"sent": 0, "seeded": 0}
+    log.info(f"Scan start — now(UTC)={datetime.utcnow().strftime('%H:%M:%S')}")
+
+    counter = {"sent": 0}
     connector = aiohttp.TCPConnector(force_close=True, limit=20)
     async with aiohttp.ClientSession(connector=connector) as session:
-        
-        if first_boot:
-            # First boot: just record all current listings so we don't spam
-            log.info("🌱 First boot — seeding seen IDs (no alerts)")
-            consumer_task = asyncio.create_task(seed_consumer(counter))
-        else:
-            # Normal operation: send alerts in real time
-            consumer_task = asyncio.create_task(alert_sender(bot, session, counter))
-        
-        # Run BOTH scanners simultaneously
+
+        consumer_task = asyncio.create_task(alert_sender(bot, session, counter))
+
         await asyncio.gather(
             scan_craigslist_stream(session),
             scan_offerup_stream(session),
         )
-        
-        # Both scanners done — drain remaining items then stop consumer
-        await alert_queue.join()       # wait for queue to empty
-        await alert_queue.put(None)    # poison pill
-        await consumer_task            # wait for consumer to exit
-        
-        if first_boot:
-            log.info(f"🌱 Seeded {counter['seeded']} IDs — next scan will send real alerts")
-            first_boot = False
-        else:
-            log.info(f"Found & sent {counter['sent']} new alerts")
-        
+
+        await alert_queue.join()
+        await alert_queue.put(None)
+        await consumer_task
+
+        log.info(f"Found & sent {counter['sent']} new alerts")
         return counter["sent"]
 
 # ─── /scan COMMAND ───
 async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global scan_running
-    
+
     if scan_running:
-        await update.message.reply_text("⏳ Scan already running...")
+        await update.message.reply_text("\u23f3 Scan already running...")
         return
-    
+
     scan_running = True
-    
+
     msg = await update.message.reply_text(
-        "🔍 *SCANNING...*\n\n"
-        f"📋 {len(CL_CITIES)} CL cities\n"
-        f"🟠 {len(OU_LOCS)} OU locations\n"
-        "📦 FREE • CARS • BOATS",
+        "\U0001f50d *SCANNING...*\n\n"
+        f"\U0001f4cb {len(CL_CITIES)} CL cities\n"
+        f"\U0001f7e0 {len(OU_LOCS)} OU locations\n"
+        "\U0001f4e6 FREE \u2022 CARS \u2022 BOATS",
         parse_mode="Markdown"
     )
-    
+
     start = datetime.utcnow()
-    total = await do_scan(context.bot)
+    total = 0
+    try:
+        total = await do_scan(context.bot)
+    finally:
+        scan_running = False
+
     elapsed = (datetime.utcnow() - start).seconds
-    
+
     await msg.edit_text(
-        f"✅ *SCAN COMPLETE*\n\n"
-        f"📤 Sent: {total} alerts\n"
-        f"⏱️ Time: {elapsed}s",
+        f"\u2705 *SCAN COMPLETE*\n\n"
+        f"\U0001f4e4 Sent: {total} alerts\n"
+        f"\u23f1\ufe0f Time: {elapsed}s",
         parse_mode="Markdown"
     )
-    
-    scan_running = False
 
 # ─── /start COMMAND ───
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 *LISTING SCANNER*\n\n"
+        "\U0001f916 *LISTING SCANNER*\n\n"
         f"/scan - Scan now\n"
         f"/status - Status\n\n"
-        f"🔄 Auto-scan: every {SCAN_INTERVAL}s\n"
-        f"🔁 Dedup via seen IDs",
+        f"\U0001f504 Auto-scan: every {SCAN_INTERVAL}s\n"
+        f"\U0001f501 Dedup via seen IDs",
         parse_mode="Markdown"
     )
 
 # ─── /status COMMAND ───
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"📊 *STATUS*\n\n"
-        f"✅ Running\n"
-        f"📂 Seen: {len(seen)}\n"
-        f"🔄 Interval: {SCAN_INTERVAL}s",
+        f"\U0001f4ca *STATUS*\n\n"
+        f"\u2705 Running\n"
+        f"\U0001f4c2 Seen: {len(seen)}\n"
+        f"\U0001f504 Interval: {SCAN_INTERVAL}s",
         parse_mode="Markdown"
     )
 
 # ─── AUTO SCANNER ───
 async def auto_scanner(bot):
-    log.info(f"🚀 Auto-scanner: every {SCAN_INTERVAL}s, dedup via seen_ids")
-    
+    log.info(f"\U0001f680 Auto-scanner: every {SCAN_INTERVAL}s, dedup via seen_ids")
+
     while not shutdown_event.is_set():
         if not scan_running:
             start = datetime.utcnow()
-            log.info(f"🔄 Auto-scan at {start.strftime('%H:%M:%S')} UTC")
-            
+            log.info(f"\U0001f504 Auto-scan at {start.strftime('%H:%M:%S')} UTC")
+
             try:
                 total = await do_scan(bot)
                 elapsed = (datetime.utcnow() - start).seconds
-                log.info(f"📊 Sent {total} alerts in {elapsed}s")
+                log.info(f"\U0001f4ca Sent {total} alerts in {elapsed}s")
             except Exception as e:
                 log.error(f"Auto-scan failed: {e}", exc_info=True)
-            
+
             cleanup_seen()
-        
-        # Use wait with timeout instead of sleep — exits immediately on shutdown
+
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=SCAN_INTERVAL)
-            break  # shutdown triggered
+            break
         except asyncio.TimeoutError:
-            pass  # normal — just loop again
+            pass
 
 # ─── SHUTDOWN EVENT ───
 shutdown_event = asyncio.Event()
@@ -460,82 +426,75 @@ shutdown_event = asyncio.Event()
 # ─── HEALTH ───
 async def health(request):
     if shutdown_event.is_set():
-        # Return 503 during shutdown so Railway stops routing to this container
         return web.Response(text="SHUTTING DOWN", status=503)
     return web.Response(text="OK")
 
 # ─── GRACEFUL SHUTDOWN ───
 def handle_signal(sig):
-    log.info(f"⛔ Received {sig.name} — shutting down gracefully")
+    log.info(f"\u26d4 Received {sig.name} \u2014 shutting down gracefully")
     shutdown_event.set()
 
 # ─── MAIN ───
 async def main():
     import signal as signal_mod
-    
+
     loop = asyncio.get_running_loop()
-    
-    # Register signal handlers so SIGTERM/SIGINT trigger clean shutdown
+
     for sig in (signal_mod.SIGTERM, signal_mod.SIGINT):
         loop.add_signal_handler(sig, handle_signal, sig)
-    
-    # Health server
+
     app_web = web.Application()
     app_web.router.add_get("/", health)
     runner = web.AppRunner(app_web)
     await runner.setup()
     port = int(os.environ.get("PORT", 8080))
     await web.TCPSite(runner, "0.0.0.0", port).start()
-    log.info(f"🌐 Health server on port {port}")
-    
-    # Bot
+    log.info(f"\U0001f310 Health server on port {port}")
+
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("scan", scan_command))
     app.add_handler(CommandHandler("status", status_command))
-    
+
     await app.initialize()
     await app.bot.delete_webhook(drop_pending_updates=True)
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
-    
-    log.info("✅ Bot ready")
-    
+
+    log.info("\u2705 Bot ready")
+
     await app.bot.send_message(
         CHAT_ID,
-        f"🚀 *BOT STARTED*\n\n"
-        f"🔄 Scanning every {SCAN_INTERVAL}s\n"
-        f"📦 FREE • CARS • BOATS\n"
-        f"🔁 Dedup via seen IDs ({len(seen)} tracked)",
+        f"\U0001f680 *BOT STARTED*\n\n"
+        f"\U0001f504 Scanning every {SCAN_INTERVAL}s\n"
+        f"\U0001f4e6 FREE \u2022 CARS \u2022 BOATS\n"
+        f"\U0001f501 Dedup via seen IDs ({len(seen)} tracked)",
         parse_mode="Markdown"
     )
-    
-    # Start auto-scanner as background task
+
     scanner_task = asyncio.create_task(auto_scanner(app.bot))
-    
-    # Wait until shutdown signal received
+
     await shutdown_event.wait()
-    
-    # ─── CLEANUP: kill the ghost ───
-    log.info("🧹 Stopping auto-scanner...")
+
+    log.info("\U0001f9f9 Stopping auto-scanner...")
     scanner_task.cancel()
     try:
         await scanner_task
     except asyncio.CancelledError:
         pass
-    
-    log.info("🧹 Stopping Telegram polling...")
+
+    log.info("\U0001f9f9 Stopping Telegram polling...")
     try:
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
     except Exception as e:
         log.warning(f"Bot shutdown error (non-fatal): {e}")
-    
-    log.info("🧹 Stopping health server...")
+
+    log.info("\U0001f9f9 Stopping health server...")
     await runner.cleanup()
-    
-    log.info("💀 Clean exit. No ghosts.")
+
+    log.info("\U0001f480 Clean exit. No ghosts.")
 
 if __name__ == "__main__":
     asyncio.run(main())
