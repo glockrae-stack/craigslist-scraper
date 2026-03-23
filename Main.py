@@ -28,35 +28,89 @@ DB_FILE = "seen_ids.json"  # Changed to JSON for time-based tracking
 MAX_AGE_MINUTES = 40       # Only alert listings within 40 minutes (when timestamp available)
 SCAN_INTERVAL = 30         # Scan every 30 seconds
 SEEN_EXPIRY_HOURS = 6      # Expire seen IDs after 6 hours (allows re-alerting old listings)
+PARALLEL_WORKERS = 10      # Number of parallel scan workers
 
-# ─── FREE PROXY LIST ───
-# Using free public proxies - refreshed from free proxy APIs
-FREE_PROXIES = []
-PROXY_FETCH_URL = "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=us&ssl=all&anonymity=all"
-LAST_PROXY_FETCH = None
+# ─── PROXY LIST ───
+# Hardcoded reliable proxies + dynamic fetch as backup
+PROXY_LIST = [
+    "http://23.88.88.105:80",
+    "http://65.108.203.35:18080",
+    "http://4.213.98.253:80",
+    "http://98.64.128.182:3129",
+    "http://38.180.226.51:3129",
+    "http://48.210.225.96:80",
+    "http://174.138.119.88:80",
+    "http://65.108.203.37:18080",
+    "http://129.150.39.242:8118",
+    "http://97.74.87.226:80",
+    "http://104.168.158.236:10818",
+    "http://167.71.60.190:8080",
+    "http://35.225.22.61:80",
+    "http://51.141.175.118:80",
+    "http://47.89.184.18:3129",
+    "http://4.213.167.178:80",
+    "http://150.136.153.231:80",
+    "http://74.176.195.135:80",
+    "http://142.93.202.130:3129",
+    "http://34.44.49.215:80",
+    "http://143.42.66.91:80",
+    "http://172.183.241.1:8080",
+    "http://20.205.61.143:80",
+    "http://52.226.125.228:8080",
+    "http://20.206.106.192:80",
+    "http://47.251.70.179:80",
+    "http://20.219.176.57:3129",
+    "http://20.44.188.17:3129",
+    "http://20.204.212.76:3129",
+    "http://20.204.214.79:3129",
+]
 
-async def fetch_free_proxies(session):
-    """Fetch fresh free proxies from ProxyScrape API."""
-    global FREE_PROXIES, LAST_PROXY_FETCH
-    try:
-        async with session.get(PROXY_FETCH_URL, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status == 200:
-                text = await resp.text()
-                proxies = [f"http://{p.strip()}" for p in text.strip().split('\n') if p.strip()]
-                if proxies:
-                    FREE_PROXIES = proxies[:50]  # Keep top 50
-                    LAST_PROXY_FETCH = datetime.now(timezone.utc)
-                    log.info(f"Fetched {len(FREE_PROXIES)} free proxies")
-                    return True
-    except Exception as e:
-        log.warning(f"Failed to fetch free proxies: {e}")
-    return False
+# Working proxies (validated during runtime)
+working_proxies = list(PROXY_LIST)
+failed_proxies = set()
 
 def get_proxy():
-    """Get a random free proxy, or None if none available."""
-    if FREE_PROXIES:
-        return random.choice(FREE_PROXIES)
-    return None
+    """Get a random working proxy with rotation."""
+    if working_proxies:
+        return random.choice(working_proxies)
+    # Reset if all failed
+    if not working_proxies and failed_proxies:
+        working_proxies.extend(PROXY_LIST)
+        failed_proxies.clear()
+    return random.choice(PROXY_LIST) if PROXY_LIST else None
+
+def mark_proxy_failed(proxy):
+    """Mark a proxy as failed."""
+    if proxy in working_proxies:
+        working_proxies.remove(proxy)
+        failed_proxies.add(proxy)
+
+def mark_proxy_success(proxy):
+    """Mark a proxy as working."""
+    if proxy in failed_proxies:
+        failed_proxies.remove(proxy)
+        if proxy not in working_proxies:
+            working_proxies.append(proxy)
+
+async def refresh_proxy_list(session):
+    """Fetch fresh proxies from ProxyScrape API to supplement list."""
+    global working_proxies
+    try:
+        url = "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=us&ssl=all&anonymity=elite"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status == 200:
+                text = await resp.text()
+                new_proxies = [f"http://{p.strip()}" for p in text.strip().split('\n') if p.strip()]
+                # Add new unique proxies
+                added = 0
+                for p in new_proxies[:30]:
+                    if p not in working_proxies and p not in failed_proxies:
+                        working_proxies.append(p)
+                        added += 1
+                if added > 0:
+                    log.info(f"Added {added} fresh proxies (total: {len(working_proxies)})")
+    except Exception as e:
+        log.debug(f"Could not refresh proxies: {e}")
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"
 
@@ -299,219 +353,239 @@ async def alert_sender(bot, session, counter):
                     pass
 
 
-# ─── CRAIGSLIST SCANNER ───
-async def scan_craigslist_stream(session):
-    """
-    Scan all CL cities. Uses ?sort=date so newest listings come first.
-    """
+# ─── CRAIGSLIST SCANNER (PARALLEL) ───
+async def scan_cl_city(session, city, slug, categories, counter):
+    """Scan a single CL city across all categories."""
+    for cat_name, cat_code in categories:
+        try:
+            url = f"https://{slug}.craigslist.org/search/{cat_code}?sort=date"
+            
+            async with session.get(
+                url, headers={"User-Agent": UA},
+                timeout=aiohttp.ClientTimeout(total=8)
+            ) as resp:
+                if resp.status != 200:
+                    continue
+                html = await resp.text()
+                soup = BeautifulSoup(html, "html.parser")
+
+                results = soup.select(".cl-static-search-result")[:15]
+                counter["found"] += len(results)
+
+                for r in results:
+                    link_tag = r.select_one("a")
+                    if not link_tag:
+                        continue
+                    href = link_tag.get("href", "")
+                    if not href:
+                        continue
+
+                    id_match = re.search(r'/(\d+)\.html', href)
+                    lid = f"cl_{id_match.group(1)}" if id_match else f"cl_{hash(href)}"
+
+                    if is_seen(lid):
+                        continue
+
+                    title_el = r.select_one(".title")
+                    title = title_el.get_text(strip=True) if title_el else "Item"
+
+                    price_el = r.select_one(".price")
+                    price = price_el.get_text(strip=True) if price_el else "FREE"
+
+                    mileage = get_mileage(title) if cat_name in ["cars", "boats"] else ""
+
+                    counter["new"] += 1
+                    await alert_queue.put({
+                        "id": lid, "source": "CL", "title": title, "link": href,
+                        "price": price, "location": city, "category": cat_name,
+                        "mileage": mileage, "time": None, "image": ""
+                    })
+
+        except Exception as e:
+            log.debug(f"CL error {city}/{cat_name}: {e}")
+        await asyncio.sleep(0.05)  # Small delay between categories
+
+
+async def scan_craigslist_parallel(session):
+    """Scan all CL cities in PARALLEL."""
     categories = [
-        ("free", "zip"),   # FREE section - highest priority
+        ("free", "zip"),
         ("cars", "cta"),
         ("boats", "boo"),
     ]
     
-    total_found = 0
-    total_new = 0
+    counter = {"found": 0, "new": 0}
     
-    for city, slug in CL_CITIES.items():
-        for cat_name, cat_code in categories:
-            try:
-                url = f"https://{slug}.craigslist.org/search/{cat_code}?sort=date"
-                log.debug(f"Scanning CL {city}/{cat_name}: {url}")
+    # Create tasks for all cities
+    tasks = [
+        scan_cl_city(session, city, slug, categories, counter)
+        for city, slug in CL_CITIES.items()
+    ]
+    
+    # Run in batches to avoid overwhelming
+    batch_size = PARALLEL_WORKERS
+    for i in range(0, len(tasks), batch_size):
+        batch = tasks[i:i + batch_size]
+        await asyncio.gather(*batch, return_exceptions=True)
+    
+    log.info(f"CL parallel scan: {counter['found']} found, {counter['new']} new")
+
+
+# ─── OFFERUP SCANNER (PARALLEL) ───
+async def scan_ou_location(session, loc, lat, lon, zipcode, categories, counter):
+    """Scan a single OU location across all categories."""
+    for cat_name, cat_param, query in categories:
+        try:
+            if query:
+                url = f"https://offerup.com/search?q={query}&lat={lat}&lon={lon}&radius=50&{cat_param}"
+            else:
+                url = f"https://offerup.com/search?q=&lat={lat}&lon={lon}&radius=50&{cat_param}"
+
+            proxy = get_proxy()
+            proxy_kwargs = {"proxy": proxy} if proxy else {}
+            
+            async with session.get(
+                url, headers={"User-Agent": UA},
+                **proxy_kwargs,
+                timeout=aiohttp.ClientTimeout(total=12)
+            ) as resp:
+                if resp.status != 200:
+                    if resp.status in [403, 407, 429] and proxy:
+                        mark_proxy_failed(proxy)
+                    continue
                 
-                async with session.get(
-                    url, headers={"User-Agent": UA},
-                    timeout=aiohttp.ClientTimeout(total=8)
-                ) as resp:
-                    if resp.status != 200:
-                        log.warning(f"CL {city}/{cat_name} HTTP {resp.status}")
+                # Proxy worked
+                if proxy:
+                    mark_proxy_success(proxy)
+                    
+                html = await resp.text()
+
+                match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
+                if not match:
+                    continue
+
+                data = json.loads(match.group(1))
+
+                tiles = (data.get("props", {})
+                             .get("pageProps", {})
+                             .get("searchFeedResponse", {})
+                             .get("looseTiles", []))
+
+                if not tiles:
+                    continue
+
+                count = 0
+                for tile in tiles:
+                    if count >= 15:
+                        break
+
+                    listing = tile.get("listing")
+                    if not listing:
                         continue
-                    html = await resp.text()
-                    soup = BeautifulSoup(html, "html.parser")
 
-                    results = soup.select(".cl-static-search-result")[:15]
-                    total_found += len(results)
+                    lid_raw = str(listing.get("listingId", ""))
+                    title = listing.get("title", "")
+                    if not lid_raw or not title:
+                        continue
 
-                    for r in results:
-                        link_tag = r.select_one("a")
-                        if not link_tag:
-                            continue
-                        href = link_tag.get("href", "")
-                        if not href:
-                            continue
+                    lid = f"ou_{lid_raw}"
+                    if is_seen(lid):
+                        continue
 
-                        id_match = re.search(r'/(\d+)\.html', href)
-                        lid = f"cl_{id_match.group(1)}" if id_match else f"cl_{hash(href)}"
+                    counter["found"] += 1
 
-                        if is_seen(lid):
-                            continue
+                    img = listing.get("image", {})
+                    if isinstance(img, dict):
+                        img_url = img.get("url", "")
+                    elif isinstance(img, str):
+                        img_url = img
+                    else:
+                        img_url = ""
 
-                        title_el = r.select_one(".title")
-                        title = title_el.get_text(strip=True) if title_el else "Item"
+                    raw_price = listing.get("price", 0)
+                    try:
+                        price_val = float(raw_price)
+                        price_str = "FREE" if price_val == 0 else f"${int(price_val)}"
+                    except (ValueError, TypeError):
+                        price_str = "FREE"
 
-                        price_el = r.select_one(".price")
-                        price = price_el.get_text(strip=True) if price_el else "FREE"
+                    mileage = ""
+                    if cat_name in ["cars", "boats"]:
+                        vm = listing.get("vehicleMiles")
+                        if vm:
+                            mileage = f"{vm} mi"
+                        else:
+                            mileage = get_mileage(title)
 
-                        mileage = get_mileage(title) if cat_name in ["cars", "boats"] else ""
+                    loc_name = listing.get("locationName", loc)
 
-                        total_new += 1
-                        await alert_queue.put({
-                            "id": lid, "source": "CL", "title": title, "link": href,
-                            "price": price, "location": city, "category": cat_name,
-                            "mileage": mileage, "time": None, "image": ""
-                        })
+                    counter["new"] += 1
+                    await alert_queue.put({
+                        "id": lid, "source": "OU", "title": title,
+                        "link": f"https://offerup.com/item/detail/{lid_raw}",
+                        "price": price_str, "location": f"{loc_name} ({zipcode})",
+                        "category": cat_name, "mileage": mileage,
+                        "time": None, "image": img_url
+                    })
+                    count += 1
 
-            except Exception as e:
-                log.warning(f"CL error {city}/{cat_name}: {e}")
-            await asyncio.sleep(0.15)
-    
-    log.info(f"CL scan complete: {total_found} found, {total_new} new")
+        except json.JSONDecodeError:
+            pass
+        except Exception as e:
+            log.debug(f"OU error {loc}/{cat_name}: {e}")
+        await asyncio.sleep(0.05)
 
 
-# ─── OFFERUP SCANNER ───
-async def scan_offerup_stream(session):
-    """
-    Scan all OU locations via __NEXT_DATA__ JSON.
-    """
+async def scan_offerup_parallel(session):
+    """Scan all OU locations in PARALLEL with proxy rotation."""
     categories = [
-        ("free", "price_max=0", ""),        # FREE items - highest priority
+        ("free", "price_max=0", ""),
         ("cars", "CATEGORY_ID=5", ""),
         ("boats", "CATEGORY_ID=5", "boat"),
     ]
     
-    total_found = 0
-    total_new = 0
-    proxy_failures = 0
+    counter = {"found": 0, "new": 0}
     
-    for loc, (lat, lon, zipcode) in OU_LOCS.items():
-        for cat_name, cat_param, query in categories:
-            try:
-                if query:
-                    url = f"https://offerup.com/search?q={query}&lat={lat}&lon={lon}&radius=50&{cat_param}"
-                else:
-                    url = f"https://offerup.com/search?q=&lat={lat}&lon={lon}&radius=50&{cat_param}"
-
-                log.debug(f"Scanning OU {loc}/{cat_name}")
-                
-                proxy = get_proxy()
-                proxy_kwargs = {"proxy": proxy} if proxy else {}
-                
-                async with session.get(
-                    url, headers={"User-Agent": UA},
-                    **proxy_kwargs,
-                    timeout=aiohttp.ClientTimeout(total=12)
-                ) as resp:
-                    if resp.status != 200:
-                        log.debug(f"OU {loc}/{cat_name} HTTP {resp.status}")
-                        if resp.status in [403, 407, 429]:
-                            proxy_failures += 1
-                        continue
-                    html = await resp.text()
-
-                    match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
-                    if not match:
-                        log.debug(f"OU {loc}/{cat_name}: no __NEXT_DATA__")
-                        continue
-
-                    data = json.loads(match.group(1))
-
-                    tiles = (data.get("props", {})
-                                 .get("pageProps", {})
-                                 .get("searchFeedResponse", {})
-                                 .get("looseTiles", []))
-
-                    if not tiles:
-                        log.debug(f"OU {loc}/{cat_name}: 0 tiles")
-                        continue
-
-                    count = 0
-                    for tile in tiles:
-                        if count >= 15:
-                            break
-
-                        listing = tile.get("listing")
-                        if not listing:
-                            continue
-
-                        lid_raw = str(listing.get("listingId", ""))
-                        title = listing.get("title", "")
-                        if not lid_raw or not title:
-                            continue
-
-                        lid = f"ou_{lid_raw}"
-                        if is_seen(lid):
-                            continue
-
-                        total_found += 1
-
-                        img = listing.get("image", {})
-                        if isinstance(img, dict):
-                            img_url = img.get("url", "")
-                        elif isinstance(img, str):
-                            img_url = img
-                        else:
-                            img_url = ""
-
-                        raw_price = listing.get("price", 0)
-                        try:
-                            price_val = float(raw_price)
-                            price_str = "FREE" if price_val == 0 else f"${int(price_val)}"
-                        except (ValueError, TypeError):
-                            price_str = "FREE"
-
-                        mileage = ""
-                        if cat_name in ["cars", "boats"]:
-                            vm = listing.get("vehicleMiles")
-                            if vm:
-                                mileage = f"{vm} mi"
-                            else:
-                                mileage = get_mileage(title)
-
-                        loc_name = listing.get("locationName", loc)
-
-                        total_new += 1
-                        await alert_queue.put({
-                            "id": lid, "source": "OU", "title": title,
-                            "link": f"https://offerup.com/item/detail/{lid_raw}",
-                            "price": price_str, "location": f"{loc_name} ({zipcode})",
-                            "category": cat_name, "mileage": mileage,
-                            "time": None, "image": img_url
-                        })
-                        count += 1
-
-            except json.JSONDecodeError as e:
-                log.warning(f"OU JSON error {loc}/{cat_name}: {e}")
-            except Exception as e:
-                log.warning(f"OU error {loc}/{cat_name}: {e}")
-            await asyncio.sleep(0.15)
+    # Create tasks for all locations
+    tasks = [
+        scan_ou_location(session, loc, lat, lon, zipcode, categories, counter)
+        for loc, (lat, lon, zipcode) in OU_LOCS.items()
+    ]
     
-    if proxy_failures > 5:
-        log.warning(f"⚠️ High proxy failure rate: {proxy_failures} failures. Proxies may need updating.")
-    log.info(f"OU scan complete: {total_found} found, {total_new} new")
+    # Run in batches
+    batch_size = PARALLEL_WORKERS
+    for i in range(0, len(tasks), batch_size):
+        batch = tasks[i:i + batch_size]
+        await asyncio.gather(*batch, return_exceptions=True)
+    
+    log.info(f"OU parallel scan: {counter['found']} found, {counter['new']} new (proxies: {len(working_proxies)} working)")
 
 
 # ─── DO SCAN ───
 async def do_scan(bot):
     """
     Main scan — runs CL and OU in PARALLEL, sends alerts in REAL TIME.
+    Uses parallel workers for maximum speed.
     """
     log.info(f"{'='*50}")
     log.info(f"SCAN START — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
-    log.info(f"Active seen IDs: {len(seen)} (expire after {SEEN_EXPIRY_HOURS}h)")
+    log.info(f"Active seen IDs: {len(seen)} | Workers: {PARALLEL_WORKERS}")
     log.info(f"{'='*50}")
 
     counter = {"sent": 0}
-    connector = aiohttp.TCPConnector(force_close=True, limit=20)
+    connector = aiohttp.TCPConnector(force_close=True, limit=50)  # Higher limit for parallel
     async with aiohttp.ClientSession(connector=connector) as session:
-        # Fetch fresh free proxies before scanning
-        await fetch_free_proxies(session)
-        log.info(f"Using {len(FREE_PROXIES)} free proxies for OfferUp")
+        # Refresh proxy list
+        await refresh_proxy_list(session)
+        log.info(f"Proxies ready: {len(working_proxies)} working")
 
+        # Start alert sender in background
         consumer_task = asyncio.create_task(alert_sender(bot, session, counter))
 
+        # Run BOTH scanners in parallel
         await asyncio.gather(
-            scan_craigslist_stream(session),
-            scan_offerup_stream(session),
+            scan_craigslist_parallel(session),
+            scan_offerup_parallel(session),
         )
 
         # Wait for queue to drain
@@ -540,11 +614,11 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     scan_running = True
 
     msg = await update.message.reply_text(
-        "🔍 *SCANNING...*\n\n"
+        "🔍 *PARALLEL SCANNING...*\n\n"
         f"📋 {len(CL_CITIES)} CL cities\n"
         f"🟠 {len(OU_LOCS)} OU locations\n"
-        "📦 FREE • CARS • BOATS\n\n"
-        f"🆓 FREE items prioritized!",
+        f"⚡ {PARALLEL_WORKERS} workers\n"
+        "📦 FREE • CARS • BOATS",
         parse_mode="Markdown"
     )
 
