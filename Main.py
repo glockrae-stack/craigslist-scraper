@@ -160,17 +160,36 @@ async def send_alert(bot, session, listing):
         log.error(f"Alert send FAILED: {e}")
         return False
 
-# ─── SCAN CRAIGSLIST ───
-async def scan_craigslist(session):
-    """Scan all CL cities for FREE, CARS, BOATS — dedup via seen_ids"""
-    listings = []
-    
+
+# ─── ALERT QUEUE (real-time sending) ───
+alert_queue = asyncio.Queue()
+
+async def alert_sender(bot, session, counter):
+    """Drains the alert queue and sends each listing immediately as it arrives."""
+    while True:
+        listing = await alert_queue.get()
+        if listing is None:  # poison pill = scan done
+            break
+        if listing["id"] in seen:
+            alert_queue.task_done()
+            continue
+        # Fetch CL image just-in-time
+        if listing["source"] == "CL" and not listing["image"]:
+            listing["image"] = await fetch_cl_image(session, listing["link"])
+        if await send_alert(bot, session, listing):
+            counter["sent"] += 1
+            mark_seen(listing["id"])
+        alert_queue.task_done()
+        await asyncio.sleep(0.03)
+
+# ─── STREAMING SCANNERS (push to queue instead of collecting) ───
+async def scan_craigslist_stream(session):
+    """Scan all CL cities and push new listings to alert_queue in real time."""
     categories = [
         ("free", "zip"),
         ("cars", "cta"),
         ("boats", "boo"),
     ]
-    
     for city, slug in CL_CITIES.items():
         for cat_name, cat_code in categories:
             try:
@@ -178,25 +197,17 @@ async def scan_craigslist(session):
                 async with session.get(url, headers={"User-Agent": UA}, timeout=aiohttp.ClientTimeout(total=8)) as resp:
                     if resp.status != 200:
                         continue
-                    
                     html = await resp.text()
                     soup = BeautifulSoup(html, "html.parser")
-                    
                     for r in soup.select(".cl-static-search-result")[:15]:
                         link = r.select_one("a")
                         if not link:
                             continue
                         href = link.get("href", "")
-                        
-                        # Get listing ID
                         id_match = re.search(r'/(\d+)\.html', href)
                         lid = f"cl_{id_match.group(1) if id_match else hash(href)}"
-                        
-                        # Skip if already seen
                         if lid in seen:
                             continue
-                        
-                        # Try to get posting time (best-effort, not required)
                         post_time = None
                         time_elem = r.select_one("time")
                         if time_elem:
@@ -210,14 +221,12 @@ async def scan_craigslist(session):
                                         post_time = parsed
                                 except Exception as e:
                                     log.warning(f"CL time parse error: {dt_str} -> {e}")
-                        
                         title_el = r.select_one(".title")
                         title = title_el.get_text(strip=True) if title_el else "Item"
                         price_el = r.select_one(".price")
                         price = price_el.get_text(strip=True) if price_el else "FREE"
                         mileage = get_mileage(title) if cat_name in ["cars", "boats"] else ""
-                        
-                        listings.append({
+                        await alert_queue.put({
                             "id": lid, "source": "CL", "title": title, "link": href,
                             "price": price, "location": city, "category": cat_name,
                             "mileage": mileage, "time": post_time, "image": ""
@@ -225,20 +234,14 @@ async def scan_craigslist(session):
             except Exception as e:
                 log.warning(f"CL error {city}/{cat_name}: {e}")
             await asyncio.sleep(0.15)
-    
-    return listings
 
-# ─── SCAN OFFERUP ───
-async def scan_offerup(session):
-    """Scan all OU locations for FREE, CARS, BOATS — dedup via seen_ids"""
-    listings = []
-    
+async def scan_offerup_stream(session):
+    """Scan all OU locations and push new listings to alert_queue in real time."""
     categories = [
         ("free", "price_max=0", ""),
         ("cars", "CATEGORY_ID=5", ""),
         ("boats", "CATEGORY_ID=5", "boat"),
     ]
-    
     for loc, (lat, lon, zipcode) in OU_LOCS.items():
         for cat_name, cat_param, query in categories:
             try:
@@ -246,35 +249,26 @@ async def scan_offerup(session):
                     url = f"https://offerup.com/search?q={query}&lat={lat}&lon={lon}&radius=50&{cat_param}"
                 else:
                     url = f"https://offerup.com/search?q=&lat={lat}&lon={lon}&radius=50&{cat_param}"
-                
                 async with session.get(url, headers={"User-Agent": UA}, proxy=get_proxy(), timeout=aiohttp.ClientTimeout(total=12)) as resp:
                     if resp.status != 200:
                         continue
-                    
                     html = await resp.text()
                     match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
                     if not match:
                         continue
-                    
                     data = json.loads(match.group(1))
                     tiles = data.get("props", {}).get("pageProps", {}).get("searchFeedResponse", {}).get("looseTiles", [])
-                    
                     for tile in tiles[:15]:
                         listing = tile.get("listing", {})
                         if not listing:
                             continue
-                        
                         lid_raw = listing.get("listingId", "")
                         lid = f"ou_{lid_raw}"
-                        
                         if lid in seen:
                             continue
-                        
                         title = listing.get("title", "")
                         if not lid_raw or not title:
                             continue
-                        
-                        # Try to get posting time (best-effort, not required)
                         post_time = None
                         created = listing.get("createdDate", listing.get("postedDate", listing.get("listDate", "")))
                         if created:
@@ -290,8 +284,6 @@ async def scan_offerup(session):
                                         post_time = parsed
                             except Exception as e:
                                 log.warning(f"OU time parse error: {created} -> {e}")
-                        
-                        # Extract image — handle both old ({url:...}) and new API format
                         img = listing.get("image", {})
                         if isinstance(img, dict):
                             img_url = img.get("url", "")
@@ -299,15 +291,13 @@ async def scan_offerup(session):
                             img_url = img
                         else:
                             img_url = ""
-                        
                         price = listing.get("price", 0)
                         try:
                             price_str = f"${int(float(price))}" if price else "FREE"
                         except:
                             price_str = "FREE"
                         mileage = get_mileage(title) if cat_name in ["cars", "boats"] else ""
-                        
-                        listings.append({
+                        await alert_queue.put({
                             "id": lid, "source": "OU", "title": title,
                             "link": f"https://offerup.com/item/detail/{lid_raw}",
                             "price": price_str, "location": f"{loc} ({zipcode})",
@@ -317,58 +307,39 @@ async def scan_offerup(session):
             except Exception as e:
                 log.warning(f"OU error {loc}/{cat_name}: {e}")
             await asyncio.sleep(0.15)
-    
-    return listings
 
 # ─── DO SCAN ───
 async def do_scan(bot):
     """
-    Main scan:
-    1. Scan all CL cities (FREE, CARS, BOATS)
-    2. Scan all OU locations (FREE, CARS, BOATS)
-    3. Dedup via seen_ids (timestamps no longer available in search results)
-    4. Sort by posting time when available, otherwise by source order
-    5. Send alerts
+    Main scan — runs CL and OU in PARALLEL, sends alerts in REAL TIME:
+    1. Start alert_sender (drains queue, sends immediately)
+    2. Run scan_craigslist_stream + scan_offerup_stream concurrently via gather()
+    3. Each scanner pushes listings to the shared queue as they're found
+    4. Alerts go out within seconds of discovery, not after the full scan
     """
     now = datetime.utcnow()
     log.info(f"Scan start — now(UTC)={now.strftime('%H:%M:%S')}")
     
-    connector = aiohttp.TCPConnector(force_close=True, limit=10)
+    counter = {"sent": 0}
+    connector = aiohttp.TCPConnector(force_close=True, limit=20)
     async with aiohttp.ClientSession(connector=connector) as session:
         
-        # Collect from both sources
-        cl_listings = await scan_craigslist(session)
-        ou_listings = await scan_offerup(session)
-        log.info(f"Found {len(cl_listings)} new CL + {len(ou_listings)} new OU listings")
+        # Start the alert sender (consumes queue in real time)
+        sender_task = asyncio.create_task(alert_sender(bot, session, counter))
         
-        # Combine all listings
-        all_listings = cl_listings + ou_listings
+        # Run BOTH scanners simultaneously
+        await asyncio.gather(
+            scan_craigslist_stream(session),
+            scan_offerup_stream(session),
+        )
         
-        if not all_listings:
-            return 0
+        # Both scanners done — drain remaining items then stop sender
+        await alert_queue.join()       # wait for queue to empty
+        await alert_queue.put(None)    # poison pill
+        await sender_task              # wait for sender to exit
         
-        # Sort: listings with time first (oldest→newest), then those without
-        all_listings.sort(key=lambda x: (x["time"] is None, x["time"] or datetime.min))
-        
-        # Fetch CL images
-        for listing in all_listings:
-            if listing["source"] == "CL" and not listing["image"]:
-                listing["image"] = await fetch_cl_image(session, listing["link"])
-                await asyncio.sleep(0.05)
-        
-        # Send alerts
-        sent = 0
-        for listing in all_listings:
-            if listing["id"] in seen:
-                continue
-            
-            if await send_alert(bot, session, listing):
-                sent += 1
-                mark_seen(listing["id"])
-            
-            await asyncio.sleep(0.03)
-        
-        return sent
+        log.info(f"Found & sent {counter['sent']} new alerts")
+        return counter["sent"]
 
 # ─── /scan COMMAND ───
 async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
